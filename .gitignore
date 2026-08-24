@@ -1,0 +1,48 @@
+# Node dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# Build output
+dist/
+build/
+
+# Environment variables & secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Authentication & session data
+auth/
+auth.json
+*.auth.json
+credentials.json
+token.json
+
+# Temporary files & runtime data
+temp/
+tmp/
+*.tmp
+*.log
+
+# Downloaded investment reports
+EquityReport/
+*.pdf
+
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

@@ -1,0 +1,24 @@
+{
+  "name": "investment-reports-crawler",
+  "version": "2.0.0",
+  "description": "Multi-site investment report crawler framework using Playwright (TypeScript) and agy CLI AI captcha recognition",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "upload:drive": "tsx src/upload_drive.ts",
+    "build": "tsc",
+    "run:dist": "node dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@google-cloud/local-auth": "^3.0.1",
+    "dotenv": "^16.4.7",
+    "googleapis": "^176.0.0",
+    "playwright": "^1.50.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
