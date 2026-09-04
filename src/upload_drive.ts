@@ -50,7 +50,6 @@ async function main() {
 
   try {
     console.log(`\n🔍 正在連接 Google Drive API...`);
-    const drive = await GoogleDriveService.getClient();
 
     // 取得/建立 Google Drive 根目錄「投資報告」
     console.log(`📁 正在確認雲端「${targetRootFolderName}」資料夾...`);
