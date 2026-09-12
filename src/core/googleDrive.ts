@@ -75,14 +75,35 @@ export class GoogleDriveService {
     }
 
     let client = this.loadSavedCredentialsIfExist();
+    if (client) {
+      try {
+        await client.getAccessToken();
+      } catch (err: any) {
+        const errMsg = String(err?.message || err);
+        if (errMsg.includes('invalid_grant') || err?.response?.data?.error === 'invalid_grant') {
+          console.warn('⚠️ 授權憑證已過期或失效 (invalid_grant)，正在清除舊 Token 並重新開啟瀏覽器授權...');
+          try {
+            if (fs.existsSync(TOKEN_PATH)) {
+              fs.unlinkSync(TOKEN_PATH);
+            }
+          } catch (e) {}
+          client = null;
+        } else {
+          throw err;
+        }
+      }
+    }
+
     if (!client) {
-      console.log('🌐 [Google Drive] 首次使用，正在開啟瀏覽器進行 Google 帳號授權...');
+      console.log('🌐 [Google Drive] 正在開啟瀏覽器進行 Google 帳號授權...');
       client = await authenticate({
         scopes: SCOPES,
         keyfilePath: CREDENTIALS_PATH,
       });
       if (client && client.credentials) {
         this.saveCredentials(client);
+        // 重新載入為標準 UserRefreshClient，使首次授權後可無縫直接繼續執行，無需手動重新執行指令
+        client = this.loadSavedCredentialsIfExist() || client;
       }
     }
 
