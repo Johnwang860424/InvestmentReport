@@ -7,6 +7,8 @@
     "start": "tsx src/index.ts",
     "upload:drive": "tsx src/upload_drive.ts",
     "clean:reports": "tsx src/cleanup_reports.ts",
+    "summarize:earnings": "tsx src/summarize_earnings.ts",
+    "rename:audio": "tsx src/rename_earnings_audio.ts",
     "build": "tsc",
     "run:dist": "node dist/index.js",
     "typecheck": "tsc --noEmit"

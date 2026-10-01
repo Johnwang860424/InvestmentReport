@@ -32,6 +32,7 @@ tmp/
 # Downloaded investment reports
 EquityReport/
 *.pdf
+EarningsCall/
 
 # Operating System files
 .DS_Store
