@@ -4,9 +4,9 @@ import { google, drive_v3 } from 'googleapis';
 import { authenticate } from '@google-cloud/local-auth';
 
 // 設定 Google Drive 存取權限範圍
+// 需要完整 drive 權限：法說會逐字稿由 Colab 寫入雲端硬碟，drive.file 只能讀寫本程式自己建立的檔案
 const SCOPES = [
-  'https://www.googleapis.com/auth/drive.file',
-  'https://www.googleapis.com/auth/drive.metadata.readonly'
+  'https://www.googleapis.com/auth/drive',
 ];
 
 const CREDENTIALS_PATH = path.join(process.cwd(), 'credentials.json');
@@ -33,6 +33,11 @@ export class GoogleDriveService {
       if (fs.existsSync(TOKEN_PATH)) {
         const content = fs.readFileSync(TOKEN_PATH, 'utf-8');
         const credentials = JSON.parse(content);
+        const grantedScopes: string[] = credentials.scopes || [];
+        if (!SCOPES.every(scope => grantedScopes.includes(scope))) {
+          console.warn('⚠️ token.json 的授權範圍與目前需求不符，將重新進行授權驗證。');
+          return null;
+        }
         return google.auth.fromJSON(credentials);
       }
     } catch (err) {
@@ -53,6 +58,7 @@ export class GoogleDriveService {
       client_id: key.client_id,
       client_secret: key.client_secret,
       refresh_token: client.credentials.refresh_token,
+      scopes: SCOPES,
     }, null, 2);
     fs.writeFileSync(TOKEN_PATH, payload, 'utf-8');
     console.log('🔑 [Google Drive] 已成功將授權 Token 儲存至 token.json');
@@ -123,21 +129,8 @@ export class GoogleDriveService {
     }
 
     const drive = await this.getClient();
-    let query = `mimeType='application/vnd.google-apps.folder' and name='${folderName.replace(/'/g, "\\'")}' and trashed=false`;
-    if (parentFolderId) {
-      query += ` and '${parentFolderId}' in parents`;
-    }
-
-    const res = await drive.files.list({
-      q: query,
-      fields: 'files(id, name)',
-      spaces: 'drive',
-    });
-
-    let folderId: string;
-    if (res.data.files && res.data.files.length > 0) {
-      folderId = res.data.files[0].id!;
-    } else {
+    let folderId = await this.findFolder(folderName, parentFolderId);
+    if (!folderId) {
       const fileMetadata: drive_v3.Schema$File = {
         name: folderName,
         mimeType: 'application/vnd.google-apps.folder',
@@ -159,61 +152,150 @@ export class GoogleDriveService {
   }
 
   /**
-   * 批次取得雲端指定資料夾內的所有檔案名稱與 ID
+   * 尋找資料夾 (不建立)，找不到時回傳 null
+   * @param folderName 資料夾名稱
+   * @param parentFolderId 父資料夾 ID (選填，預設為「我的雲端硬碟」根目錄)
    */
-  public static async getFolderFilesMap(folderId: string): Promise<Map<string, string>> {
+  public static async findFolder(folderName: string, parentFolderId?: string): Promise<string | null> {
     const drive = await this.getClient();
-    const map = new Map<string, string>();
+    const query =
+      `mimeType='application/vnd.google-apps.folder' and name='${folderName.replace(/'/g, "\\'")}' ` +
+      `and '${parentFolderId || 'root'}' in parents and trashed=false`;
+
+    const res = await drive.files.list({
+      q: query,
+      fields: 'files(id, name)',
+      spaces: 'drive',
+    });
+    return res.data.files?.[0]?.id || null;
+  }
+
+  /**
+   * 依路徑逐層尋找資料夾，例如 ['投資報告', 'EarningsCall', '202609']；任一層不存在即回傳 null
+   */
+  public static async findFolderByPath(folderNames: string[]): Promise<string | null> {
+    let parentId: string | undefined = undefined;
+    for (const name of folderNames) {
+      const id: string | null = await this.findFolder(name, parentId);
+      if (!id) return null;
+      parentId = id;
+    }
+    return parentId || null;
+  }
+
+  /**
+   * 取得指定資料夾內的所有檔案 (不含子資料夾)，含修改時間
+   */
+  public static async listFolderFiles(folderId: string): Promise<drive_v3.Schema$File[]> {
+    return this.listChildren(folderId, false);
+  }
+
+  /**
+   * 分頁列出資料夾內未刪除的檔案或子資料夾
+   */
+  private static async listChildren(folderId: string, folders: boolean): Promise<drive_v3.Schema$File[]> {
+    const drive = await this.getClient();
+    const items: drive_v3.Schema$File[] = [];
     let pageToken: string | undefined = undefined;
 
     do {
-      const res: drive_v3.Schema$FileList | any = await drive.files.list({
-        q: `'${folderId}' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false`,
-        fields: 'nextPageToken, files(id, name)',
+      const res: any = await drive.files.list({
+        q: `'${folderId}' in parents and mimeType${folders ? '=' : '!='}'application/vnd.google-apps.folder' and trashed=false`,
+        fields: 'nextPageToken, files(id, name, modifiedTime, size)',
         pageSize: 1000,
         pageToken: pageToken,
       });
-
-      if (res.data.files) {
-        for (const file of res.data.files) {
-          if (file.name && file.id) {
-            map.set(file.name, file.id);
-          }
-        }
-      }
+      items.push(...(res.data.files || []));
       pageToken = res.data.nextPageToken || undefined;
     } while (pageToken);
 
-    return map;
+    return items;
+  }
+
+  /** 名稱 → ID 對照表 */
+  private static toNameIdMap(items: drive_v3.Schema$File[]): Map<string, string> {
+    return new Map(items.filter(f => f.name && f.id).map(f => [f.name!, f.id!]));
+  }
+
+  /**
+   * 雲端檔案的最後修改時間 (毫秒)，無資料時回傳 0
+   */
+  public static modifiedTimeMs(file: drive_v3.Schema$File): number {
+    return file.modifiedTime ? Date.parse(file.modifiedTime) : 0;
+  }
+
+  /**
+   * 下載雲端檔案到本地路徑
+   */
+  public static async downloadFile(fileId: string, destPath: string): Promise<void> {
+    const drive = await this.getClient();
+    const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
+    const tmpPath = `${destPath}.download`;
+    await new Promise<void>((resolve, reject) => {
+      const dest = fs.createWriteStream(tmpPath);
+      res.data.on('error', reject).pipe(dest).on('error', reject).on('finish', resolve);
+    });
+    fs.renameSync(tmpPath, destPath);
+  }
+
+  /**
+   * 以文字讀取雲端檔案內容 (例如 manifest.json)
+   */
+  public static async readFileText(fileId: string): Promise<string> {
+    const drive = await this.getClient();
+    const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'text' });
+    return res.data as unknown as string;
+  }
+
+  /**
+   * 以文字覆蓋雲端檔案內容 (保留檔案 ID 與分享設定)
+   */
+  public static async writeFileText(fileId: string, text: string, mimeType = 'application/json'): Promise<void> {
+    const drive = await this.getClient();
+    await drive.files.update({ fileId, media: { mimeType, body: text } });
+  }
+
+  /**
+   * 重新命名雲端檔案 (檔案 ID 與分享連結不變)
+   */
+  public static async renameFile(fileId: string, newName: string): Promise<void> {
+    const drive = await this.getClient();
+    await drive.files.update({ fileId, requestBody: { name: newName } });
+  }
+
+  /**
+   * 將雲端檔案或資料夾移到垃圾桶 (30 天內可從雲端硬碟復原)
+   */
+  public static async trashFile(fileId: string): Promise<void> {
+    const drive = await this.getClient();
+    await drive.files.update({ fileId, requestBody: { trashed: true } });
+  }
+
+  /**
+   * 覆蓋雲端既有檔案的內容 (保留檔案 ID 與分享設定)
+   */
+  public static async replaceFile(fileId: string, filePath: string): Promise<drive_v3.Schema$File> {
+    const drive = await this.getClient();
+    const res = await drive.files.update({
+      fileId,
+      media: { body: fs.createReadStream(filePath) },
+      fields: 'id, name, modifiedTime',
+    });
+    return res.data;
+  }
+
+  /**
+   * 批次取得雲端指定資料夾內的所有檔案名稱與 ID
+   */
+  public static async getFolderFilesMap(folderId: string): Promise<Map<string, string>> {
+    return this.toNameIdMap(await this.listChildren(folderId, false));
   }
 
   /**
    * 批次取得雲端指定資料夾內的所有子資料夾名稱與 ID
    */
   public static async getFolderDirsMap(folderId: string): Promise<Map<string, string>> {
-    const drive = await this.getClient();
-    const map = new Map<string, string>();
-    let pageToken: string | undefined = undefined;
-
-    do {
-      const res: any = await drive.files.list({
-        q: `'${folderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-        fields: 'nextPageToken, files(id, name)',
-        pageSize: 1000,
-        pageToken: pageToken,
-      });
-
-      if (res.data.files) {
-        for (const dir of res.data.files) {
-          if (dir.name && dir.id) {
-            map.set(dir.name, dir.id);
-          }
-        }
-      }
-      pageToken = res.data.nextPageToken || undefined;
-    } while (pageToken);
-
-    return map;
+    return this.toNameIdMap(await this.listChildren(folderId, true));
   }
 
   /**
@@ -267,7 +349,6 @@ export class GoogleDriveService {
       return stats;
     }
 
-    const drive = await this.getClient();
     const folderName = path.basename(localDirPath);
     const currentDriveFolderId = await this.getOrCreateFolder(folderName, parentDriveFolderId);
 
@@ -308,15 +389,16 @@ export class GoogleDriveService {
       }
     }
 
-    // 3. 鏡像清理：刪除本地不存在的雲端檔案
+    // 3. 鏡像清理：本地不存在的雲端檔案移到垃圾桶
+    //    (token 為完整 drive 權限，看得到非本工具建立的檔案，因此不永久刪除，保留復原機會)
     for (const [cloudFileName, cloudFileId] of existingCloudFiles.entries()) {
       if (!localFileNames.has(cloudFileName)) {
         const displayPath = relativePath ? `${relativePath}/${cloudFileName}` : cloudFileName;
         try {
-          console.log(`🗑️ [雲端清理] 刪除本地已不存在的檔案: ${displayPath}...`);
-          await drive.files.delete({ fileId: cloudFileId });
+          console.log(`🗑️ [雲端清理] 本地已不存在的檔案移到垃圾桶: ${displayPath}...`);
+          await this.trashFile(cloudFileId);
           stats.deleted++;
-          console.log(`🗑️ [已刪除] ${displayPath}`);
+          console.log(`🗑️ [已移到垃圾桶] ${displayPath}`);
         } catch (err: any) {
           console.error(`❌ [刪除失敗] ${displayPath}: ${err.message}`);
         }
@@ -330,15 +412,15 @@ export class GoogleDriveService {
       await this.syncDirectory(subDirPath, currentDriveFolderId, stats, subRelativePath);
     }
 
-    // 5. 鏡像清理：刪除本地不存在的雲端子資料夾
+    // 5. 鏡像清理：本地不存在的雲端子資料夾移到垃圾桶
     for (const [cloudDirName, cloudDirId] of existingCloudDirs.entries()) {
       if (!localDirNames.has(cloudDirName)) {
         const displayPath = relativePath ? `${relativePath}/${cloudDirName}` : cloudDirName;
         try {
-          console.log(`🗑️ [雲端清理] 刪除本地已不存在的資料夾: ${displayPath}...`);
-          await drive.files.delete({ fileId: cloudDirId });
+          console.log(`🗑️ [雲端清理] 本地已不存在的資料夾移到垃圾桶: ${displayPath}...`);
+          await this.trashFile(cloudDirId);
           stats.deleted++;
-          console.log(`🗑️ [資料夾已刪除] ${displayPath}`);
+          console.log(`🗑️ [資料夾已移到垃圾桶] ${displayPath}`);
         } catch (err: any) {
           console.error(`❌ [資料夾刪除失敗] ${displayPath}: ${err.message}`);
         }
