@@ -15,7 +15,8 @@
 2. 下載「影音連結資訊」中的影音（irconference mp4、webpro 串流、YouTube 及 yt-dlp 能解析的網站），
    或使用 ./EarningsCall/audio 內手動補抓的音檔
 3. 切成數段交給 agy (雲端 Gemini) 轉成繁體中文逐字稿，存到 ./EarningsCall/<YYYYMM>/；轉錄時背景預先下載後面幾場
-4. ./EarningsCall/manifest.json 記錄已處理的場次，重跑時自動跳過
+4. ./EarningsCall/manifest.json 記錄已處理的場次，重跑時自動跳過；
+   有 token.json (npm run upload:drive 授權產生) 時與雲端 Colab 的 manifest.json 同步，兩邊不會重複轉錄
    - 失敗分為「永久」（該連結不是影音、影片已刪除）與「暫時」（YouTube 驗證、網路問題），暫時性失敗隔一段時間自動重試
    - 公司之後補上新的影音連結時，會自動重新處理
 
@@ -55,7 +56,9 @@ YT_PLAYER_CLIENTS = 'tv,web_safari,mweb'   # YouTube 播放器用戶端，依序
 YT_SLEEP_SECONDS = 10                      # 每支 YouTube 下載前等待秒數，降低被判定為機器人；0 = 不等
 
 # 與 src/core/earnings.ts 共用的路徑
+CLOUD_EARNINGS_PATH = ['投資報告', 'EarningsCall']
 EARNINGS_ROOT = Path.cwd() / 'EarningsCall'
+TOKEN_PATH = Path.cwd() / 'token.json'
 MANIFEST_PATH = EARNINGS_ROOT / 'manifest.json'
 AUDIO_DIR = EARNINGS_ROOT / 'audio'
 WORK = Path.cwd() / 'temp' / 'earnings_call'
@@ -95,17 +98,142 @@ PERMANENT_ERROR_PATTERNS = [
 ]
 
 
+class CloudManifest:
+    """讀寫雲端「投資報告/EarningsCall/manifest.json」(Colab 使用的同一份)。
+    沿用 npm run upload:drive 等指令授權產生的 token.json，直接呼叫 Google Drive REST API。"""
+
+    TOKEN_API = 'https://oauth2.googleapis.com/token'
+    API = 'https://www.googleapis.com/drive/v3/files'
+    UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3/files'
+    FOLDER = 'application/vnd.google-apps.folder'
+
+    def __init__(self, token_path):
+        self.creds = json.loads(token_path.read_text(encoding='utf-8'))
+        self.access_token = None
+        self.expires_at = 0
+        self.file_id = None
+
+    def _request(self, method, url, headers=None, **kwargs):
+        import requests
+
+        if time.time() > self.expires_at - 60:
+            r = requests.post(self.TOKEN_API, timeout=30, data={
+                'client_id': self.creds['client_id'], 'client_secret': self.creds['client_secret'],
+                'refresh_token': self.creds['refresh_token'], 'grant_type': 'refresh_token'})
+            if r.status_code != 200:
+                raise RuntimeError(f'Google 授權失敗 ({r.text.strip()[:100]})，請執行 npm run upload:drive 重新授權')
+            self.access_token = r.json()['access_token']
+            self.expires_at = time.time() + r.json().get('expires_in', 3600)
+        r = requests.request(method, url, timeout=60, **kwargs,
+                             headers={'Authorization': f'Bearer {self.access_token}', **(headers or {})})
+        r.raise_for_status()
+        return r
+
+    def _find(self, name, parent, folder):
+        op = '=' if folder else '!='
+        q = (f"name='{name}' and '{parent}' in parents and trashed=false "
+             f"and mimeType{op}'{self.FOLDER}'")
+        files = self._request('GET', self.API, params={'q': q, 'fields': 'files(id)', 'spaces': 'drive'}).json()['files']
+        return files[0]['id'] if files else None
+
+    def _create(self, name, parent, mime):
+        body = {'name': name, 'parents': [parent], 'mimeType': mime}
+        return self._request('POST', self.API, json=body, params={'fields': 'id'}).json()['id']
+
+    def _manifest_id(self, create):
+        if self.file_id:
+            return self.file_id
+        parent = 'root'
+        for name in CLOUD_EARNINGS_PATH:
+            folder_id = self._find(name, parent, folder=True)
+            if not folder_id:
+                if not create:
+                    return None
+                folder_id = self._create(name, parent, self.FOLDER)
+            parent = folder_id
+        self.file_id = self._find(MANIFEST_PATH.name, parent, folder=False)
+        if not self.file_id and create:
+            self.file_id = self._create(MANIFEST_PATH.name, parent, 'application/json')
+        return self.file_id
+
+    def load(self):
+        file_id = self._manifest_id(create=False)
+        if not file_id:
+            return {}
+        text = self._request('GET', f'{self.API}/{file_id}', params={'alt': 'media'}).text
+        return json.loads(text) if text.strip() else {}
+
+    def save(self, manifest):
+        file_id = self._manifest_id(create=True)
+        data = json.dumps(manifest, ensure_ascii=False, indent=1).encode('utf-8')
+        self._request('PATCH', f'{self.UPLOAD_API}/{file_id}', params={'uploadType': 'media'},
+                      data=data, headers={'Content-Type': 'application/json'})
+
+
+_cloud = None        # CloudManifest；None = manifest 只存本地
+_prune_month = None  # (年, 月)：合併雲端紀錄後再清一次過期紀錄，避免已清除的紀錄被合併回來
+
+
+def connect_cloud(enabled):
+    global _cloud
+    if not enabled:
+        return
+    if not TOKEN_PATH.exists():
+        print('⚠️ 找不到 token.json，manifest 只存本地；執行一次 npm run upload:drive 授權後即可與 Colab 同步')
+        return
+    try:
+        _cloud = CloudManifest(TOKEN_PATH)
+    except (ValueError, KeyError) as e:
+        print(f'⚠️ token.json 格式不符 ({e})，manifest 只存本地')
+
+
+def record_rank(rec):
+    """兩邊都有同一場紀錄時的取捨：已完成優先，其次取最後更新時間較新者。"""
+    return rec.get('status') == 'done', rec.get('updated') or rec.get('last_attempt') or ''
+
+
+def merge_manifest(manifest, other):
+    for key, rec in other.items():
+        if key not in manifest or record_rank(rec) > record_rank(manifest[key]):
+            manifest[key] = rec
+
+
+def cloud_failed(action, e):
+    global _cloud
+    _cloud = None
+    print(f'⚠️ 雲端 manifest {action}失敗，本次改為只存本地 (下次執行會再合併)：{short_error(str(e))[:200]}')
+
+
 def load_manifest():
+    manifest = {}
     if MANIFEST_PATH.exists():
-        return json.loads(MANIFEST_PATH.read_text(encoding='utf-8'))
-    return {}
+        manifest = json.loads(MANIFEST_PATH.read_text(encoding='utf-8'))
+    if _cloud:
+        try:
+            merge_manifest(manifest, _cloud.load())
+        except Exception as e:
+            cloud_failed('讀取', e)
+    return manifest
 
 
 def save_manifest(manifest):
+    """存本地，並與雲端合併後寫回；先讀最新的雲端內容合併，避免蓋掉 Colab 同時寫入的紀錄。"""
+    if _cloud:
+        try:
+            merge_manifest(manifest, _cloud.load())
+            if _prune_month:
+                prune_manifest(manifest, *_prune_month)
+        except Exception as e:
+            cloud_failed('讀取', e)
     MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = MANIFEST_PATH.with_suffix('.tmp')
     tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding='utf-8')
     os.replace(tmp, MANIFEST_PATH)
+    if _cloud:
+        try:
+            _cloud.save(manifest)
+        except Exception as e:
+            cloud_failed('寫入', e)
 
 
 def safe_name(s):
@@ -693,6 +821,7 @@ def parse_args():
     parser.add_argument('--cookies-from-browser', metavar='BROWSER',
                         help='改從瀏覽器讀取 YouTube cookies，例如 firefox')
     parser.add_argument('--failed', action='store_true', help='只列出失敗的場次與下次是否重試，不執行轉錄')
+    parser.add_argument('--no-sync', action='store_true', help='manifest 只存本地，不與雲端 (Colab) 同步')
     args = parser.parse_args()
 
     if args.month:
@@ -712,8 +841,10 @@ def parse_args():
 def main():
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding='utf-8', errors='replace')
+    global _prune_month
     args = parse_args()
     manual = manual_sources(args.url)
+    connect_cloud(not args.no_sync)
 
     if args.failed:
         show_failed(manual)
@@ -726,16 +857,18 @@ def main():
     print('  🎙️ 法說會影音 → 逐字稿')
     print('=====================================================')
     print(f'📁 輸出目錄:   {out_dir}')
-    print(f'📋 Manifest:   {MANIFEST_PATH}\n')
+    print(f'📋 Manifest:   {MANIFEST_PATH}' + (f'（與雲端 {"/".join(CLOUD_EARNINGS_PATH)} 同步）' if _cloud else ''))
+    print()
 
     cli_keys = {arg.partition('=')[0] for arg in args.url}
     events = fetch_events(args.year, args.mon, args.markets, args.codes, manual, cli_keys)
 
     manifest = load_manifest()
+    _prune_month = (args.year, args.mon)
     pruned = prune_manifest(manifest, args.year, args.mon)
     todo, backfilled = plan(events, manifest, out_dir, set(args.redo), args.limit)
-    if pruned or backfilled:
-        save_manifest(manifest)
+    if pruned or backfilled or _cloud:
+        save_manifest(manifest)  # 同步時一併把本地獨有的紀錄寫回雲端
     print(f'manifest 清除 {pruned} 筆過期紀錄；本次待處理 {len(todo)} 場\n')
     if not todo:
         return

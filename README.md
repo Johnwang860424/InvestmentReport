@@ -198,8 +198,8 @@ npm run upload:drive -- --dir <路徑>    # 指定要同步的本地目錄
 整體流程：
 
 ```
-方式 A：npm run transcribe:earnings ──► 本地 EarningsCall/<YYYYMM>/*.txt + EarningsCall/manifest.json
-方式 B：Colab notebook             ──► 雲端 投資報告/EarningsCall/<YYYYMM>/*.txt + 雲端 manifest.json
+方式 A：npm run transcribe:earnings ──► 本地 EarningsCall/<YYYYMM>/*.txt ┐
+方式 B：Colab notebook             ──► 雲端 投資報告/EarningsCall/<YYYYMM>/*.txt ┴► 共用雲端 manifest.json
        │
 npm run summarize:earnings  ──► 下載方式 B 的雲端逐字稿，產生本地 EarningsCall/<YYYYMM>/*.md (摘要)
        │
@@ -208,7 +208,10 @@ npm run upload:drive        ──► 摘要上傳雲端；已摘要的 Colab �
 
 ### 1. 轉逐字稿（兩種方式擇一）
 
-兩種方式各自記錄處理狀態（本地與雲端各一份 `manifest.json`），但都會跳過已有逐字稿或摘要的場次。**交替使用時，先執行 `summarize:earnings` 與 `upload:drive` 再換另一邊**，避免同一場被轉錄兩次。
+兩種方式共用雲端 `投資報告/EarningsCall/manifest.json` 記錄處理狀態，對方已完成的場次會自動跳過，可隨意交替使用：
+* 本機版每次存檔都先讀取雲端最新內容合併再寫回（本地 `EarningsCall/manifest.json` 為備份），Colab 存檔時同樣先合併，同時執行也不會蓋掉對方的紀錄；同一場兩邊都有紀錄時，以「已完成」優先，其次取較新的紀錄。
+* 本機版沿用 `npm run upload:drive` 授權產生的 `token.json` 存取雲端；沒有 `token.json`、加上 `--no-sync`，或雲端暫時連不上時只存本地，下次同步時再合併。
+* Colab 掛載的雲端硬碟看到本機剛寫入的內容可能有延遲，兩邊同時處理同一個月份時偶爾仍可能重複轉錄同一場。
 
 #### 方式 A：本機 + agy (`scripts/transcribe_earnings.py`)
 ```powershell
@@ -218,11 +221,12 @@ npm run transcribe:earnings -- --month 202609               # 補抓指定月份
 npm run transcribe:earnings -- --codes 2330,2317            # 只處理特定股票代號
 npm run transcribe:earnings -- --redo 2330_20261015         # 強制重做 (可重複指定)
 npm run transcribe:earnings -- --url 2330_20261015=<網址>   # 手動指定影音來源 (可重複指定)
-npm run transcribe:earnings -- --failed                     # 列出失敗場次與下次是否重試
+npm run transcribe:earnings -- --failed                     # 列出失敗場次與下次是否重試 (含 Colab 的紀錄)
+npm run transcribe:earnings -- --no-sync                    # manifest 只存本地，不與雲端同步
 npm run transcribe:earnings -- --help                       # 所有參數
 ```
 * 從公開資訊觀測站抓取當月法說會清單與影音連結（irconference、webpro、YouTube 等），下載音訊後切成每 10 分鐘一段（`--chunk-minutes`），同時交給 `agy` 轉成繁體中文逐字稿，再依時間合併；預設模型與摘要相同，可用 `--model` 指定。
-* 以 `EarningsCall/manifest.json` 記錄處理狀態，重跑時自動跳過已完成場次（已有逐字稿或摘要的場次也會補登為完成），暫時性失敗會隔一段時間重試；可隨時 `Ctrl+C` 中斷，重跑從未完成的場次繼續。
+* 依共用的 `manifest.json` 自動跳過已完成場次（本地已有逐字稿或摘要的場次也會補登為完成），暫時性失敗會隔一段時間重試；可隨時 `Ctrl+C` 中斷，重跑從未完成的場次繼續。
 * **agy 額度**：一小時的法說會約 6 次 agy 呼叫，場次多的月份用量不小。agy 失敗（額度用完、逾時、輸出不是逐字稿）不會把影音連結記為失效，下次執行直接重試；連續 3 場因 agy 失敗會自動停止，稍後重跑即可。
 * `--url` 的來源可為網址、Google Drive 分享連結（需設為「知道連結的任何人」可檢視）或本地檔案路徑，會優先於觀測站連結嘗試；場次代號或日期錯誤時會出現「不在本月清單」的警告。
 * YouTube 要求登入驗證時，加上 `--cookies <cookies.txt>` 或 `--cookies-from-browser firefox`。有安裝 Node.js 時會自動提供給 yt-dlp 解析 YouTube。
@@ -232,7 +236,7 @@ npm run transcribe:earnings -- --help                       # 所有參數
 2. 在「設定」格調整月份、市場等參數後依序執行。notebook 會：
    * 從公開資訊觀測站抓取當月法說會清單與影音連結（irconference、webpro、YouTube 等）。
    * 下載音訊並以 faster-whisper 轉成繁體中文逐字稿，存到雲端 `投資報告/EarningsCall/<YYYYMM>/`。
-   * 以雲端的 `manifest.json` 記錄處理狀態，重跑時自動跳過已完成場次（雲端已有摘要的場次也會跳過），暫時性失敗會隔一段時間重試。
+   * 以共用的雲端 `manifest.json` 記錄處理狀態，重跑時自動跳過已完成場次（含本機版完成的場次；雲端已有摘要的場次也會跳過），暫時性失敗會隔一段時間重試。
 3. 常用設定：
 
 | 設定 | 說明 |
