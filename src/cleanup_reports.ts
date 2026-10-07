@@ -7,14 +7,18 @@ import {
   CLOUD_EARNINGS_PATH,
   EARNINGS_FOLDER,
   MANIFEST_NAME,
+  type Manifest,
   loadCloudManifest,
+  loadManifest,
+  saveManifest,
 } from './core/earnings';
 
 const DEFAULT_MONTHS = 2;
 const DEFAULT_DIRS = ['EquityReport', EARNINGS_FOLDER];
 // 雲端只依日期清理 CLOUD_EARNINGS_PATH (EquityReport 由 upload:drive 鏡像同步清除，不在此處理)；
-// 其中 audio 為手動補抓的法說會音檔，檔名日期在結尾，清空後保留資料夾供 rename:audio 使用；
-// manifest.json 為 Colab 記錄法說會處理狀態的檔案，依紀錄的召開日期 (date) 移除過期場次
+// EarningsCall/audio 為手動補抓的法說會音檔，檔名日期在結尾，清空後保留資料夾供 rename:audio 使用；
+// EarningsCall/manifest.json 為記錄轉錄狀態的檔案 (本地由 transcribe:earnings、雲端由 Colab 寫入)，
+// 依紀錄的召開日期 (date) 移除過期場次
 
 function printHelp(): void {
   console.log(`
@@ -33,13 +37,14 @@ function printHelp(): void {
   以檔名前綴的日期 (YYYYMMDD_...) 為準，研究報告為報告日期、法說會逐字稿與摘要為召開日期，
   早於保留期限者刪除；清空後的子資料夾一併移除。
   檔名無日期前綴者一律保留並提示。
+  ${EARNINGS_FOLDER}/${AUDIO_FOLDER} 的音檔以檔名結尾的召開日期判斷 (公司名稱(代號)-YYYYMMDD，由 rename:audio 命名)，
+  與逐字稿同步刪除；資料夾清空後保留。
+  ${EARNINGS_FOLDER}/${MANIFEST_NAME} 中召開日期 (date) 早於保留期限的場次紀錄一併移除。
 
 雲端:
-  「${CLOUD_EARNINGS_PATH.join('/')}」依相同規則清理，檔案移到垃圾桶，30 天內可復原。
-  其中「${AUDIO_FOLDER}」的音檔以檔名結尾的召開日期判斷 (公司名稱(代號)-YYYYMMDD，由 rename:audio 命名)，
-  與逐字稿同步刪除；資料夾清空後保留。
-  「${MANIFEST_NAME}」中召開日期 (date) 早於保留期限的場次紀錄一併移除。
-  請勿在 Colab 執行轉錄時清理，否則 Colab 存檔會把移除的紀錄寫回。
+  「${CLOUD_EARNINGS_PATH.join('/')}」依相同規則清理，檔案移到垃圾桶，30 天內可復原；
+  Colab 寫入的 ${MANIFEST_NAME} 同樣移除過期紀錄。
+  請勿在 transcribe:earnings 或 Colab 轉錄期間清理，否則轉錄存檔會把移除的紀錄寫回。
   指定 --dir 或 --local-only 時不處理雲端。
 
 提示:
@@ -95,28 +100,37 @@ interface CleanupStats {
   freedBytes: number;
 }
 
-/** 遞迴掃描目錄，刪除報告日期早於 cutoff 的檔案，並移除因此清空的子資料夾。 */
-function cleanDirectory(dir: string, cutoff: Date, dryRun: boolean, stats: CleanupStats, label: string): void {
+/**
+ * 遞迴掃描目錄，刪除報告日期早於 cutoff 的檔案，並移除因此清空的子資料夾。
+ * isEarningsRoot 為 EarningsCall 根目錄：manifest.json 另由 pruneManifest 清理，audio 資料夾清空後保留。
+ */
+function cleanDirectory(
+  dir: string, cutoff: Date, dryRun: boolean, stats: CleanupStats, label: string,
+  parseDate: DateParser = parseReportDate, isEarningsRoot = false,
+): void {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const fullPath = path.join(dir, entry.name);
     const displayPath = label ? `${label}/${entry.name}` : entry.name;
 
     if (entry.isDirectory()) {
-      cleanDirectory(fullPath, cutoff, dryRun, stats, displayPath);
-      if (!dryRun && fs.readdirSync(fullPath).length === 0) {
+      const isAudio = isEarningsRoot && entry.name === AUDIO_FOLDER;
+      cleanDirectory(fullPath, cutoff, dryRun, stats, displayPath, isAudio ? parseAudioDate : parseDate);
+      if (!dryRun && !isAudio && fs.readdirSync(fullPath).length === 0) {
         fs.rmdirSync(fullPath);
         console.log(`🗑️ [移除空資料夾] ${displayPath}`);
       }
       continue;
     }
     if (!entry.isFile()) continue;
+    if (isEarningsRoot && entry.name === MANIFEST_NAME) continue;
 
     stats.total++;
 
-    const reportDate = parseReportDate(entry.name);
+    const reportDate = parseDate(entry.name);
     if (!reportDate) {
       stats.skipped++;
-      console.warn(`⚠️ [無日期] 保留: ${displayPath}`);
+      const hint = parseDate === parseAudioDate ? ' (可先執行 npm run rename:audio 統一檔名)' : '';
+      console.warn(`⚠️ [無日期] 保留: ${displayPath}${hint}`);
       continue;
     }
 
@@ -210,36 +224,53 @@ async function cleanCloudDirectory(
   return remaining === 0;
 }
 
+/** 刪除 manifest 中召開日期早於 cutoff 的場次紀錄並回傳數量；無日期的紀錄保留 (與轉錄程式的 prune_manifest 相同)。 */
+function removeExpired(manifest: Manifest, cutoff: Date, dryRun: boolean, displayPath: string): number {
+  const expired = Object.entries(manifest).filter(([, rec]) => {
+    const date = toValidDate(/^(\d{4})-(\d{2})-(\d{2})$/.exec(rec.date || ''));
+    return date !== null && date < cutoff;
+  });
+  for (const [key] of expired) {
+    delete manifest[key];
+    console.log(`${dryRun ? '🔍 [預覽]' : '🗑️ [移除紀錄]'} ${displayPath}: ${key}`);
+  }
+  return expired.length;
+}
+
+/** 移除本地 manifest.json 的過期紀錄；回傳移除筆數，失敗時回傳 null。 */
+function pruneManifest(cutoff: Date, dryRun: boolean): number | null {
+  const displayPath = `${EARNINGS_FOLDER}/${MANIFEST_NAME}`;
+  try {
+    const manifest = loadManifest();
+    if (!manifest) return 0;
+    const removed = removeExpired(manifest, cutoff, dryRun, displayPath);
+    if (removed > 0 && !dryRun) {
+      saveManifest(manifest);
+    }
+    return removed;
+  } catch (error: any) {
+    console.error(`❌ [失敗] ${displayPath}: ${error.message}`);
+    return null;
+  }
+}
+
 /**
- * 移除雲端 manifest.json 中召開日期早於 cutoff 的場次紀錄；回傳移除筆數，失敗時回傳 null。
- * 無日期的紀錄保留 (與 Colab 的 prune_manifest 相同)。
+ * 移除雲端 (Colab) manifest.json 的過期紀錄；回傳移除筆數，失敗時回傳 null。
+ * 請勿在 Colab 轉錄期間執行，否則 Colab 存檔會把移除的紀錄寫回。
  */
 async function pruneCloudManifest(folderId: string, cutoff: Date, dryRun: boolean, label: string): Promise<number | null> {
-  const displayPath = `${label}/${MANIFEST_NAME}`;
-
+  const displayPath = `☁️ ${label}/${MANIFEST_NAME}`;
   try {
     const loaded = await loadCloudManifest(folderId);
-    if (!loaded) {
-      console.warn(`⚠️ 雲端找不到「${displayPath}」，略過。`);
-      return 0;
-    }
-    const { fileId, manifest } = loaded;
-    const expired = Object.entries(manifest).filter(([, rec]) => {
-      const date = toValidDate(/^(\d{4})-(\d{2})-(\d{2})$/.exec(rec.date || ''));
-      return date !== null && date < cutoff;
-    });
-
-    for (const [key] of expired) {
-      delete manifest[key];
-      console.log(`${dryRun ? '🔍 [預覽]' : '🗑️ [移除紀錄]'} ☁️ ${displayPath}: ${key}`);
-    }
-    if (expired.length > 0 && !dryRun) {
+    if (!loaded) return 0;
+    const removed = removeExpired(loaded.manifest, cutoff, dryRun, displayPath);
+    if (removed > 0 && !dryRun) {
       // 與 Colab save_manifest 的 json.dumps(ensure_ascii=False, indent=1) 格式一致
-      await GoogleDriveService.writeFileText(fileId, JSON.stringify(manifest, null, 1));
+      await GoogleDriveService.writeFileText(loaded.fileId, JSON.stringify(loaded.manifest, null, 1));
     }
-    return expired.length;
+    return removed;
   } catch (error: any) {
-    console.error(`❌ [失敗] ☁️ ${displayPath}: ${error.message}`);
+    console.error(`❌ [失敗] ${displayPath}: ${error.message}`);
     return null;
   }
 }
@@ -312,11 +343,13 @@ async function main(): Promise<void> {
       console.warn(`⚠️ 目錄不存在，略過: ${localPath}`);
       continue;
     }
-    cleanDirectory(localPath, cutoff, dryRun, stats, path.basename(localPath));
+    const label = path.basename(localPath);
+    cleanDirectory(localPath, cutoff, dryRun, stats, label, parseReportDate, label === EARNINGS_FOLDER);
   }
+  const manifestPruned = values.dir ? 0 : pruneManifest(cutoff, dryRun);
 
   let cloudStats: CleanupStats | null = null;
-  let manifestPruned: number | null = 0;
+  let cloudManifestPruned: number | null = 0;
   if (cleanCloud) {
     console.log(`\n☁️ 正在掃描雲端「${CLOUD_EARNINGS_PATH.join('/')}」...\n`);
     const folderId = await GoogleDriveService.findFolderByPath(CLOUD_EARNINGS_PATH);
@@ -324,7 +357,7 @@ async function main(): Promise<void> {
       const label = CLOUD_EARNINGS_PATH[CLOUD_EARNINGS_PATH.length - 1];
       cloudStats = { total: 0, deleted: 0, kept: 0, skipped: 0, failed: 0, freedBytes: 0 };
       await cleanCloudDirectory(folderId, cutoff, dryRun, cloudStats, label);
-      manifestPruned = await pruneCloudManifest(folderId, cutoff, dryRun, label);
+      cloudManifestPruned = await pruneCloudManifest(folderId, cutoff, dryRun, label);
     } else {
       console.warn(`⚠️ 雲端找不到「${CLOUD_EARNINGS_PATH.join('/')}」，略過。`);
     }
@@ -337,16 +370,19 @@ async function main(): Promise<void> {
   console.log('=====================================================');
   console.log(`⏱️  耗時:       ${duration} 秒`);
   printStats('📁 本地', stats, dryRun);
+  if (!values.dir) {
+    console.log(`📋 manifest:   ${manifestPruned === null ? '❌ 清理失敗' : `${dryRun ? '可移除' : '已移除'} ${manifestPruned} 筆紀錄`}`);
+  }
   if (cloudStats) {
     printStats(`☁️ 雲端 (${dryRun ? '預覽' : '已移到垃圾桶'})`, cloudStats, dryRun);
-    console.log(`📋 manifest:   ${manifestPruned === null ? '❌ 清理失敗' : `${dryRun ? '可移除' : '已移除'} ${manifestPruned} 筆紀錄`}`);
+    console.log(`📋 manifest:   ${cloudManifestPruned === null ? '❌ 清理失敗' : `${dryRun ? '可移除' : '已移除'} ${cloudManifestPruned} 筆紀錄`}`);
   }
   console.log('=====================================================');
 
   if (!dryRun && stats.deleted > 0) {
     console.log('\n💡 執行 npm run upload:drive 可同步清除雲端 EquityReport 對應檔案。');
   }
-  if (stats.failed > 0 || (cloudStats?.failed ?? 0) > 0 || manifestPruned === null) {
+  if (stats.failed > 0 || (cloudStats?.failed ?? 0) > 0 || manifestPruned === null || cloudManifestPruned === null) {
     process.exitCode = 1;
   }
 }

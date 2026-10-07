@@ -4,7 +4,7 @@ import { google, drive_v3 } from 'googleapis';
 import { authenticate } from '@google-cloud/local-auth';
 
 // 設定 Google Drive 存取權限範圍
-// 需要完整 drive 權限：法說會逐字稿由 Colab 寫入雲端硬碟，drive.file 只能讀寫本程式自己建立的檔案
+// 需要完整 drive 權限：法說會逐字稿與 manifest 由 Colab 寫入雲端硬碟，drive.file 只能讀寫本程式自己建立的檔案
 const SCOPES = [
   'https://www.googleapis.com/auth/drive',
 ];

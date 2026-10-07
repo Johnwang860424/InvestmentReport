@@ -18,7 +18,7 @@
 5. **Google Drive 鏡像同步**：
    * 研究報告增量上傳至雲端「投資報告」資料夾，本地刪除的檔案雲端同步移到垃圾桶。
 6. **法說會逐字稿與摘要**：
-   * Colab 從公開資訊觀測站抓取法說會影音，以 GPU 上的 faster-whisper 轉成逐字稿；本地再用 `agy` 產生 Markdown 摘要並上傳雲端。
+   * 從公開資訊觀測站抓取法說會影音，轉成逐字稿（本機用 `agy` 雲端轉錄，或在 Google Colab 用 GPU 跑 faster-whisper），再用 `agy` 產生 Markdown 摘要並上傳雲端。
 7. **過期報告清理**：
    * 依檔名日期自動清除本地與雲端超過保留期限的報告、逐字稿與音檔。
 
@@ -51,11 +51,13 @@
 │   ├── cleanup_reports.ts     # 🧹 清理過期報告
 │   ├── summarize_earnings.ts  # 📝 法說會逐字稿摘要
 │   └── rename_earnings_audio.ts # 🏷️ 法說會音檔重新命名
+├── scripts/
+│   └── transcribe_earnings.py # 🎙️ 法說會影音 → 逐字稿 (本機，agy 轉錄，以 uv 執行)
 ├── colab/
-│   └── earnings_call_transcribe.ipynb # 🎙️ 法說會影音 → 逐字稿 (Google Colab)
+│   └── earnings_call_transcribe.ipynb # 🎙️ 法說會影音 → 逐字稿 (Google Colab GPU)
 ├── auth/                      # 🔐 各站點 Session 儲存目錄 (自動生成)
 ├── EquityReport/              # 📥 下載之個股研究報告 PDF (依站點分子目錄)
-├── EarningsCall/              # 📝 法說會摘要 (<YYYYMM>/*.md)
+├── EarningsCall/              # 📝 法說會逐字稿與摘要 (<YYYYMM>/*.txt、*.md)、manifest.json、audio/
 ├── credentials.json           # Google OAuth 憑證 (自行放置)
 ├── token.json                 # Google 授權 Token (首次授權後自動生成)
 ├── .env.example               # 環境變數範本
@@ -75,7 +77,9 @@ npm install
 npx playwright install chromium
 ```
 
-另需安裝 Antigravity CLI (`agy`) 並加入 PATH，供驗證碼辨識與法說會摘要使用。
+另需安裝：
+* Antigravity CLI (`agy`) 並加入 PATH，供驗證碼辨識、法說會轉逐字稿與摘要使用。
+* [uv](https://docs.astral.sh/uv/)（`winget install astral-sh.uv`），供法說會轉逐字稿使用；Python 與套件會在首次執行時自動安裝，不需另外安裝 Python 或 ffmpeg。
 
 ### 2. 設定帳號密碼
 在根目錄建立 `.env` 檔案（可複製 `.env.example`）：
@@ -185,7 +189,7 @@ npm run upload:drive -- --dir <路徑>    # 指定要同步的本地目錄
 
 * **增量上傳**：雲端已有同名檔案則跳過。
 * **鏡像清理**：本地已刪除的報告，雲端對應檔案會移到垃圾桶。
-* **法說會摘要**：同時把 `./EarningsCall/<YYYYMM>/*.md` 上傳到雲端同名月份資料夾（雲端沒有或本地較新才上傳）；已有對應摘要的雲端逐字稿 (`.txt`) 會移到垃圾桶。`EarningsCall` 不做鏡像刪除，也不能用 `--dir` 指定。
+* **法說會摘要**：同時把 `./EarningsCall/<YYYYMM>/*.md` 上傳到雲端同名月份資料夾（雲端沒有或本地較新才上傳；月份資料夾不存在時自動建立）；已有對應摘要的 Colab 雲端逐字稿 (`.txt`) 會移到垃圾桶。本地的逐字稿、`manifest.json`、音檔不上傳。`EarningsCall` 不做鏡像刪除，也不能用 `--dir` 指定。
 
 ---
 
@@ -194,19 +198,45 @@ npm run upload:drive -- --dir <路徑>    # 指定要同步的本地目錄
 整體流程：
 
 ```
-Colab notebook ──► 雲端 投資報告/EarningsCall/<YYYYMM>/*.txt (逐字稿) + manifest.json
+方式 A：npm run transcribe:earnings ──► 本地 EarningsCall/<YYYYMM>/*.txt ┐
+方式 B：Colab notebook             ──► 雲端 投資報告/EarningsCall/<YYYYMM>/*.txt ┴► 共用雲端 manifest.json
        │
-npm run summarize:earnings ──► 本地 EarningsCall/<YYYYMM>/*.md (摘要)
+npm run summarize:earnings  ──► 下載方式 B 的雲端逐字稿，產生本地 EarningsCall/<YYYYMM>/*.md (摘要)
        │
-npm run upload:drive ──► 摘要上傳雲端，已摘要的逐字稿移到垃圾桶
+npm run upload:drive        ──► 摘要上傳雲端；已摘要的 Colab 雲端逐字稿移到垃圾桶
 ```
 
-### 1. Colab 轉逐字稿 (`colab/earnings_call_transcribe.ipynb`)
+### 1. 轉逐字稿（兩種方式擇一）
+
+兩種方式共用雲端 `投資報告/EarningsCall/manifest.json` 記錄處理狀態，對方已完成的場次會自動跳過，可隨意交替使用：
+* 本機版每次存檔都先讀取雲端最新內容合併再寫回（本地 `EarningsCall/manifest.json` 為備份），Colab 存檔時同樣先合併，同時執行也不會蓋掉對方的紀錄；同一場兩邊都有紀錄時，以「已完成」優先，其次取較新的紀錄。
+* 本機版沿用 `npm run upload:drive` 授權產生的 `token.json` 存取雲端；沒有 `token.json`、加上 `--no-sync`，或雲端暫時連不上時只存本地，下次同步時再合併。
+* Colab 掛載的雲端硬碟看到本機剛寫入的內容可能有延遲，兩邊同時處理同一個月份時偶爾仍可能重複轉錄同一場。
+
+#### 方式 A：本機 + agy (`scripts/transcribe_earnings.py`)
+```powershell
+npm run transcribe:earnings                                 # 處理當月 (台北時間)
+npm run transcribe:earnings -- --concurrency 1              # 遇到 agy 額度限制時降低同時轉寫段數
+npm run transcribe:earnings -- --month 202609               # 補抓指定月份
+npm run transcribe:earnings -- --codes 2330,2317            # 只處理特定股票代號
+npm run transcribe:earnings -- --redo 2330_20261015         # 強制重做 (可重複指定)
+npm run transcribe:earnings -- --url 2330_20261015=<網址>   # 手動指定影音來源 (可重複指定)
+npm run transcribe:earnings -- --failed                     # 列出失敗場次與下次是否重試 (含 Colab 的紀錄)
+npm run transcribe:earnings -- --no-sync                    # manifest 只存本地，不與雲端同步
+npm run transcribe:earnings -- --help                       # 所有參數
+```
+* 從公開資訊觀測站抓取當月法說會清單與影音連結（irconference、webpro、YouTube 等），下載音訊後切成每 10 分鐘一段（`--chunk-minutes`），同時交給 `agy` 轉成繁體中文逐字稿，再依時間合併；預設模型與摘要相同，可用 `--model` 指定。
+* 依共用的 `manifest.json` 自動跳過已完成場次（本地已有逐字稿或摘要的場次也會補登為完成），暫時性失敗會隔一段時間重試；可隨時 `Ctrl+C` 中斷，重跑從未完成的場次繼續。
+* **agy 額度**：一小時的法說會約 6 次 agy 呼叫，場次多的月份用量不小。agy 失敗（額度用完、逾時、輸出不是逐字稿）不會把影音連結記為失效，下次執行直接重試；連續 3 場因 agy 失敗會自動停止，稍後重跑即可。
+* `--url` 的來源可為網址、Google Drive 分享連結（需設為「知道連結的任何人」可檢視）或本地檔案路徑，會優先於觀測站連結嘗試；場次代號或日期錯誤時會出現「不在本月清單」的警告。
+* YouTube 要求登入驗證時，加上 `--cookies <cookies.txt>` 或 `--cookies-from-browser firefox`。有安裝 Node.js 時會自動提供給 yt-dlp 解析 YouTube。
+
+#### 方式 B：Colab GPU (`colab/earnings_call_transcribe.ipynb`)
 1. 在 Google Colab 開啟 notebook，**執行階段 → 變更執行階段類型 → GPU**，執行階段版本選 `2026.07`（faster-whisper 需要 CUDA 12）。
 2. 在「設定」格調整月份、市場等參數後依序執行。notebook 會：
    * 從公開資訊觀測站抓取當月法說會清單與影音連結（irconference、webpro、YouTube 等）。
    * 下載音訊並以 faster-whisper 轉成繁體中文逐字稿，存到雲端 `投資報告/EarningsCall/<YYYYMM>/`。
-   * 以 `manifest.json` 記錄處理狀態，重跑時自動跳過已完成場次，暫時性失敗會隔一段時間重試。
+   * 以共用的雲端 `manifest.json` 記錄處理狀態，重跑時自動跳過已完成場次（含本機版完成的場次；雲端已有摘要的場次也會跳過），暫時性失敗會隔一段時間重試。
 3. 常用設定：
 
 | 設定 | 說明 |
@@ -219,20 +249,25 @@ npm run upload:drive ──► 摘要上傳雲端，已摘要的逐字稿移到�
 
 > 若 `URL_OVERRIDES` 的 key 格式錯誤，清單格會出現「URL_OVERRIDES 中這些場次不在本月清單」的警告，覆寫網址不會生效。
 
+
 ### 2. 產生摘要
 ```powershell
 npm run summarize:earnings                        # 處理當月 (台北時間)
 npm run summarize:earnings -- --month 202609      # 指定月份
 npm run summarize:earnings -- --concurrency 1     # 遇到 agy 額度限制時降低同時處理數
 npm run summarize:earnings -- --force             # 已有摘要的場次也重新產生
+npm run summarize:earnings -- --local-only        # 不下載雲端 (Colab) 逐字稿
 ```
-比對雲端逐字稿與本地摘要，只處理尚未摘要、或逐字稿在摘要後又更新過的場次。完成後執行 `npm run upload:drive` 上傳。
+先下載 Colab 寫入雲端的逐字稿（本地沒有或雲端較新者），再比對本地逐字稿與摘要，只處理尚未摘要、或逐字稿在摘要後又更新過的場次。完成後執行 `npm run upload:drive` 上傳。
 
-### 3. 手動補抓的音檔命名
-Colab 無法下載的場次，可把音檔放到雲端 `投資報告/EarningsCall/audio/`，再統一命名為 `公司名稱(代號)-YYYYMMDD.副檔名`：
+### 3. 手動補抓的音檔
+無法自動下載的場次，統一命名為 `公司名稱(代號)-YYYYMMDD.副檔名`：
+* 方式 A：放到本地 `EarningsCall/audio/` 後重跑 `transcribe:earnings`，會優先使用這些音檔。
+* 方式 B：放到雲端 `投資報告/EarningsCall/audio/`，分享連結填入 `URL_OVERRIDES`。
 ```powershell
-npm run rename:audio -- --dry-run    # 預覽
+npm run rename:audio -- --dry-run    # 預覽本地音檔改名 (依 manifest.json 比對公司與日期)
 npm run rename:audio                 # 實際改名
+npm run rename:audio -- --cloud      # 改名雲端 audio 資料夾 (同時參考 Colab 的 manifest)
 ```
 
 ---
@@ -246,8 +281,9 @@ npm run clean:reports -- --dry-run     # 僅預覽
 npm run clean:reports -- --local-only  # 只清理本地
 ```
 
-* 以檔名前綴日期 (`YYYYMMDD_...`) 判斷，無日期的檔案保留並提示。
-* 雲端 `EarningsCall` 的逐字稿、摘要、音檔移到垃圾桶（30 天內可復原），`manifest.json` 的過期紀錄一併移除。**請勿在 Colab 轉錄期間執行**。
+* 以檔名前綴日期 (`YYYYMMDD_...`) 判斷，無日期的檔案保留並提示；`EarningsCall/audio/` 的音檔以檔名結尾的召開日期判斷。
+* 本地與雲端 `EarningsCall/manifest.json` 的過期紀錄一併移除。**請勿在 `transcribe:earnings` 或 Colab 轉錄期間執行**。
+* 雲端 `EarningsCall` 的逐字稿、摘要、音檔依相同規則移到垃圾桶（30 天內可復原）。
 * 刪除後執行 `npm run upload:drive`，雲端 `EquityReport` 會同步清除。
 
 ---

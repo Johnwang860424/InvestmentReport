@@ -3,7 +3,15 @@ import { spawn } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import { GoogleDriveService } from './core/googleDrive';
-import { CLOUD_EARNINGS_PATH, EARNINGS_FOLDER, VERSION_LABEL, readSummaryVersion, summaryNameOf } from './core/earnings';
+import {
+  CLOUD_EARNINGS_PATH,
+  EARNINGS_FOLDER,
+  LOCAL_EARNINGS_ROOT,
+  VERSION_LABEL,
+  readSummaryVersion,
+  summaryNameOf,
+  transcriptVersionMs,
+} from './core/earnings';
 
 const DEFAULT_MODEL = 'claude-opus-5-5-high';
 const AGY_TIMEOUT_MS = 15 * 60 * 1000;
@@ -23,15 +31,41 @@ function printHelp(): void {
   npm run summarize:earnings -- --limit <N>        本次最多摘要幾場 (測試用)
   npm run summarize:earnings -- --concurrency <N>  同時摘要幾場 (預設: ${DEFAULT_CONCURRENCY})，遇到 agy 額度限制可調低為 1
   npm run summarize:earnings -- --force            已有摘要的場次也重新產生
+  npm run summarize:earnings -- --local-only       不下載雲端 (Colab) 的逐字稿
   npm run summarize:earnings -- --help             顯示此說明
 
 流程:
-  1. 比對雲端「${CLOUD_EARNINGS_PATH.join('/')}/<YYYYMM>」的逐字稿 (.txt) 與本地 ./${EARNINGS_FOLDER}/<YYYYMM> 的摘要 (.md)，
+  1. 下載 Colab 寫入雲端「${CLOUD_EARNINGS_PATH.join('/')}/<YYYYMM>」的逐字稿 (本地沒有或雲端較新者)
+  2. 比對 ./${EARNINGS_FOLDER}/<YYYYMM> 的逐字稿 (.txt，由 npm run transcribe:earnings 或 Colab 產生) 與摘要 (.md)，
      找出尚未摘要、或逐字稿在摘要後又更新過的場次 (摘要內記錄了逐字稿版本)
-  2. 同時處理多場：下載逐字稿、用 agy 產生同名 .md，完成後刪除本地逐字稿
+  3. 同時處理多場：用 agy 產生同名 .md
   摘要完成後執行 npm run upload:drive 上傳至雲端 (同名檔案直接覆蓋)
 =====================================================
 `);
+}
+
+/**
+ * 下載 Colab 寫入雲端的逐字稿到本地月份資料夾；本地檔案的修改時間設為雲端修改時間，
+ * 摘要記錄的版本因此與雲端一致，upload:drive 才能判斷雲端逐字稿是否已摘要。回傳下載份數。
+ */
+async function pullCloudTranscripts(month: string, localDir: string): Promise<number> {
+  const folderId = await GoogleDriveService.findFolderByPath([...CLOUD_EARNINGS_PATH, month]);
+  if (!folderId) return 0;
+
+  let downloaded = 0;
+  for (const file of await GoogleDriveService.listFolderFiles(folderId)) {
+    if (!file.name?.endsWith('.txt')) continue;
+    const txtPath = path.join(localDir, file.name);
+    const cloudMs = GoogleDriveService.modifiedTimeMs(file);
+    if (fs.existsSync(txtPath) && transcriptVersionMs(txtPath) >= cloudMs) continue;
+    if (readSummaryVersion(summaryNameOf(txtPath)) >= cloudMs) continue; // 已摘要過這個版本
+    await GoogleDriveService.downloadFile(file.id!, txtPath);
+    const modified = new Date(cloudMs);
+    fs.utimesSync(txtPath, modified, modified);
+    downloaded++;
+    console.log(`📥 [下載逐字稿] ${file.name}`);
+  }
+  return downloaded;
 }
 
 function currentMonth(): string {
@@ -135,6 +169,7 @@ async function main(): Promise<void> {
     limit: { type: 'string' as const, short: 'n' },
     concurrency: { type: 'string' as const, short: 'c' },
     force: { type: 'boolean' as const, short: 'f' },
+    'local-only': { type: 'boolean' as const },
     help: { type: 'boolean' as const, short: 'h' },
   };
 
@@ -153,13 +188,11 @@ async function main(): Promise<void> {
   const concurrency = parsePositiveInt('--concurrency', values.concurrency, DEFAULT_CONCURRENCY);
   const model = values.model || DEFAULT_MODEL;
   const force = values.force === true;
-  const localDir = path.join(process.cwd(), EARNINGS_FOLDER, month);
-  const cloudPath = [...CLOUD_EARNINGS_PATH, month];
+  const localDir = path.join(LOCAL_EARNINGS_ROOT, month);
 
   console.log('=====================================================');
   console.log('  📝 法說會逐字稿摘要 (agy)');
   console.log('=====================================================');
-  console.log(`☁️ 雲端目錄:   ${cloudPath.join('/')}`);
   console.log(`📁 本地目錄:   ${localDir}`);
   console.log(`🤖 摘要模型:   ${model}`);
   console.log(`⚡ 同時處理:   ${concurrency} 場`);
@@ -168,46 +201,45 @@ async function main(): Promise<void> {
   }
 
   const startTime = Date.now();
-  const stats = { downloaded: 0, summarized: 0, skipped: 0, failed: 0 };
+  const stats = { summarized: 0, skipped: 0, failed: 0 };
 
-  // 1. 比對雲端逐字稿與本地摘要，找出待摘要場次
-  console.log(`\n🔍 正在連接 Google Drive API...`);
-  const folderId = await GoogleDriveService.findFolderByPath(cloudPath);
-  if (!folderId) {
-    throw new Error(`雲端找不到資料夾：${cloudPath.join('/')}`);
-  }
+  // 1. 下載 Colab 產生的雲端逐字稿；無法連線雲端時只處理本地逐字稿
   fs.mkdirSync(localDir, { recursive: true });
+  if (values['local-only'] !== true) {
+    console.log(`\n☁️ 檢查雲端「${[...CLOUD_EARNINGS_PATH, month].join('/')}」的逐字稿...`);
+    try {
+      const downloaded = await pullCloudTranscripts(month, localDir);
+      console.log(`☁️ 下載 ${downloaded} 份雲端逐字稿`);
+    } catch (err: any) {
+      console.warn(`⚠️ 無法讀取雲端逐字稿，只處理本地逐字稿：${err.message}`);
+    }
+  }
 
-  const cloudFiles = await GoogleDriveService.listFolderFiles(folderId);
-  const cloudTxts = cloudFiles.filter(f => f.name?.endsWith('.txt'));
-  const pending = cloudTxts
-    .filter(file => {
-      if (force) return true;
-      const mdPath = path.join(localDir, summaryNameOf(file.name!));
-      return readSummaryVersion(mdPath) < GoogleDriveService.modifiedTimeMs(file);
-    })
-    .sort((a, b) => a.name!.localeCompare(b.name!))
+  // 2. 比對逐字稿與摘要，找出待摘要場次
+  const txts = fs.readdirSync(localDir).filter(name => name.endsWith('.txt')).sort();
+  const pending = txts
+    .filter(name => force
+      || readSummaryVersion(path.join(localDir, summaryNameOf(name))) < transcriptVersionMs(path.join(localDir, name)))
     .slice(0, limit);
 
-  console.log(`\n🤖 雲端共有 ${cloudTxts.length} 份逐字稿，待摘要 ${pending.length} 場\n`);
+  console.log(`\n🤖 共有 ${txts.length} 份逐字稿，待摘要 ${pending.length} 場\n`);
 
-  // 2. 同時處理 concurrency 場：下載、摘要，完成後刪除本地逐字稿
+  // 3. 同時處理 concurrency 場
   //    連續失敗達上限時不再開始新場次，進行中的場次會跑完
   let consecutiveFailures = 0;
   let nextIndex = 0;
   let stopped = false;
 
   const processOne = async (index: number): Promise<void> => {
-    const file = pending[index];
-    const name = file.name!;
+    const name = pending[index];
     const txtPath = path.join(localDir, name);
     const mdPath = summaryNameOf(txtPath);
     const t0 = Date.now();
     console.log(`🤖 [摘要中] (${index + 1}/${pending.length}) ${name}...`);
     try {
-      await GoogleDriveService.downloadFile(file.id!, txtPath);
-      stats.downloaded++;
-      fs.writeFileSync(mdPath, await summarize(txtPath, model, file.modifiedTime!), 'utf-8');
+      // 先記下版本，摘要期間逐字稿若被重做，下次會再摘要
+      const version = new Date(transcriptVersionMs(txtPath)).toISOString();
+      fs.writeFileSync(mdPath, await summarize(txtPath, model, version), 'utf-8');
       stats.summarized++;
       consecutiveFailures = 0;
       console.log(`✅ [完成] ${path.basename(mdPath)} (${((Date.now() - t0) / 1000).toFixed(0)} 秒)`);
@@ -224,8 +256,6 @@ async function main(): Promise<void> {
         stopped = true;
         console.error(`\n⛔ 連續失敗 ${MAX_CONSECUTIVE_FAILURES} 次，可能已達 agy 額度上限，不再開始新的場次；稍後重跑會從未完成的場次繼續。`);
       }
-    } finally {
-      fs.rmSync(txtPath, { force: true });
     }
   };
 
@@ -241,7 +271,6 @@ async function main(): Promise<void> {
   console.log('  🎉 完成！');
   console.log('=====================================================');
   console.log(`⏱️  耗時:       ${duration} 秒`);
-  console.log(`📥 下載逐字稿: ${stats.downloaded}`);
   console.log(`🤖 新增摘要:   ${stats.summarized}`);
   if (stats.skipped > 0) {
     console.log(`⏩ 逐字稿過短: ${stats.skipped}`);

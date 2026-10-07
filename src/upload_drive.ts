@@ -20,7 +20,8 @@ function printHelp() {
   🧹 鏡像清理: 本地若已刪除報告，雲端對應檔案會移到垃圾桶
   📝 法說會摘要: 將 ./${EARNINGS_FOLDER}/<YYYYMM>/*.md 上傳至雲端同名月份資料夾，
                  雲端沒有或本地較新才上傳，同名檔案直接覆蓋 (不做鏡像刪除)；
-                 雲端已有對應摘要的逐字稿 (.txt) 移到垃圾桶，摘要後又更新的逐字稿保留
+                 雲端已有對應摘要的 Colab 逐字稿 (.txt) 移到垃圾桶，摘要後又更新的逐字稿保留；
+                 本地的逐字稿、manifest、音檔不上傳
 =====================================================
 `);
 }
@@ -34,17 +35,11 @@ interface EarningsUploadStats {
 
 /**
  * 上傳法說會摘要 (.md) 到雲端「投資報告/EarningsCall/<YYYYMM>」
- * 雲端月份資料夾另有 Colab 產生的逐字稿、manifest 等檔案，因此不做鏡像刪除；
- * 只有雲端已存在對應摘要的逐字稿 (.txt) 會移到垃圾桶
+ * 只上傳本地的摘要，不做鏡像刪除 (過期摘要由 clean:reports 依日期清理雲端)；
+ * 雲端月份資料夾另有 Colab 產生的逐字稿，雲端已存在對應摘要者移到垃圾桶
  */
 async function uploadEarningsSummaries(localRoot: string, rootFolderId: string): Promise<EarningsUploadStats> {
   const stats: EarningsUploadStats = { uploaded: 0, replaced: 0, transcriptsTrashed: 0, failed: 0 };
-
-  const earningsFolderId = await GoogleDriveService.findFolder(EARNINGS_FOLDER, rootFolderId);
-  if (!earningsFolderId) {
-    console.warn(`⚠️ 雲端找不到「${EARNINGS_FOLDER}」資料夾，略過法說會摘要上傳。`);
-    return stats;
-  }
 
   const monthDirs = fs.readdirSync(localRoot, { withFileTypes: true })
     .filter(entry => entry.isDirectory() && /^\d{6}$/.test(entry.name))
@@ -56,11 +51,8 @@ async function uploadEarningsSummaries(localRoot: string, rootFolderId: string):
     const localMds = fs.readdirSync(localDir).filter(name => name.endsWith('.md')).sort();
     if (localMds.length === 0) continue;
 
-    const folderId = await GoogleDriveService.findFolder(month, earningsFolderId);
-    if (!folderId) {
-      console.warn(`⚠️ 雲端找不到「${EARNINGS_FOLDER}/${month}」資料夾，略過 ${localMds.length} 份摘要。`);
-      continue;
-    }
+    const earningsFolderId = await GoogleDriveService.getOrCreateFolder(EARNINGS_FOLDER, rootFolderId);
+    const folderId = await GoogleDriveService.getOrCreateFolder(month, earningsFolderId);
 
     const cloudFiles = await GoogleDriveService.listFolderFiles(folderId);
     const cloudMds = new Map(cloudFiles.filter(f => f.name?.endsWith('.md')).map(f => [f.name!, f]));
@@ -91,7 +83,7 @@ async function uploadEarningsSummaries(localRoot: string, rootFolderId: string):
       }
     }
 
-    // 雲端摘要已是該逐字稿版本 (或更新) 時，逐字稿不再需要，移到垃圾桶；
+    // 雲端摘要已是該逐字稿版本 (或更新) 時，Colab 逐字稿不再需要，移到垃圾桶；
     // 摘要後 Colab 又重做過的逐字稿較新，保留給下次摘要
     for (const txt of cloudFiles.filter(f => f.name?.endsWith('.txt'))) {
       const mdName = summaryNameOf(txt.name!);
@@ -138,7 +130,7 @@ async function main() {
     process.exit(1);
   }
 
-  // 雲端 EarningsCall 有 Colab 產生的逐字稿、manifest、audio 等本地沒有的檔案，不可鏡像同步
+  // 本地與雲端 EarningsCall 各有對方沒有的檔案 (本地逐字稿、Colab 逐字稿與 manifest 等)，不可鏡像同步
   if (path.basename(localPath) === EARNINGS_FOLDER) {
     console.error(`\n❌ 「${EARNINGS_FOLDER}」不能用 --dir 鏡像同步；法說會摘要會在同步後自動上傳。`);
     process.exit(1);
