@@ -7,6 +7,8 @@
     "start": "tsx src/index.ts",
     "upload:drive": "tsx src/upload_drive.ts",
     "clean:reports": "tsx src/cleanup_reports.ts",
+    "transcribe:earnings": "uv run scripts/transcribe_earnings.py",
+    "transcribe:earnings:gpu": "uv run --with nvidia-cublas-cu12 --with \"nvidia-cudnn-cu12==9.*\" scripts/transcribe_earnings.py",
     "summarize:earnings": "tsx src/summarize_earnings.ts",
     "rename:audio": "tsx src/rename_earnings_audio.ts",
     "build": "tsc",

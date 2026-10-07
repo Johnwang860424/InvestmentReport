@@ -1,15 +1,12 @@
 import { parseArgs } from 'util';
+import * as fs from 'fs';
 import * as path from 'path';
-import { GoogleDriveService } from './core/googleDrive';
 import {
-  AUDIO_FOLDER,
-  CLOUD_EARNINGS_PATH,
-  MANIFEST_NAME,
+  LOCAL_AUDIO_DIR,
+  LOCAL_MANIFEST_PATH,
   type ManifestEntry,
-  loadCloudManifest,
+  loadManifest,
 } from './core/earnings';
-
-const CLOUD_AUDIO_PATH = [...CLOUD_EARNINGS_PATH, AUDIO_FOLDER];
 
 function printHelp(): void {
   console.log(`
@@ -17,18 +14,18 @@ function printHelp(): void {
   🏷️ 法說會音檔重新命名工具
 =====================================================
 使用方式:
-  npm run rename:audio                 重新命名「${CLOUD_AUDIO_PATH.join('/')}」內的音檔
+  npm run rename:audio                 重新命名「${LOCAL_AUDIO_DIR}」內的音檔
   npm run rename:audio -- --dry-run    僅預覽，不實際改名
   npm run rename:audio -- --help       顯示此說明
 
 命名格式:
   公司名稱(股票代號)-YYYYMMDD.副檔名，例如 三芳(1307)-20260916.mp4
+  npm run transcribe:earnings 會優先使用以此格式命名的音檔
 
 比對方式:
-  從「${[...CLOUD_EARNINGS_PATH, MANIFEST_NAME].join('/')}」取得本次法說會的所有公司，
+  從「${LOCAL_MANIFEST_PATH}」取得法說會的所有公司 (先執行 npm run transcribe:earnings 產生)，
   依檔名中的股票代號比對，找不到再依公司名稱比對；
   符合多場時以檔名中的日期 (YYYYMMDD 或 YYMMDD) 篩選，仍無法唯一判定則略過並提示。
-  改名不會改變檔案 ID，既有分享連結維持有效。
 =====================================================
 `);
 }
@@ -82,21 +79,17 @@ function matchEntry(fileName: string, entries: ManifestEntry[]): { entry: Manife
 }
 
 function targetName(entry: ManifestEntry, fileName: string): string {
-  // 去掉 Windows 檔名不允許的字元 (例如「聖暉*」的 *)，方便下載到本地
+  // 去掉 Windows 檔名不允許的字元 (例如「聖暉*」的 *)
   const name = entry.name.replace(/[\\/:*?"<>|]/g, '');
   return `${name}(${entry.code})-${entry.date.replace(/-/g, '')}${path.extname(fileName)}`;
 }
 
-async function loadManifest(): Promise<ManifestEntry[]> {
-  const folderId = await GoogleDriveService.findFolderByPath(CLOUD_EARNINGS_PATH);
-  if (!folderId) {
-    throw new Error(`雲端找不到「${CLOUD_EARNINGS_PATH.join('/')}」`);
+function loadEntries(): ManifestEntry[] {
+  const manifest = loadManifest();
+  if (!manifest) {
+    throw new Error(`找不到「${LOCAL_MANIFEST_PATH}」，請先執行 npm run transcribe:earnings`);
   }
-  const loaded = await loadCloudManifest(folderId);
-  if (!loaded) {
-    throw new Error(`雲端找不到「${[...CLOUD_EARNINGS_PATH, MANIFEST_NAME].join('/')}」`);
-  }
-  return Object.values(loaded.manifest).filter((e): e is ManifestEntry => !!(e.code && e.name && e.date));
+  return Object.values(manifest).filter((e): e is ManifestEntry => !!(e.code && e.name && e.date));
 }
 
 async function main(): Promise<void> {
@@ -117,24 +110,25 @@ async function main(): Promise<void> {
   console.log('=====================================================');
   console.log('  🏷️ 法說會音檔重新命名');
   console.log('=====================================================');
-  console.log(`☁️ 音檔目錄:   ${CLOUD_AUDIO_PATH.join('/')}`);
-  console.log(`📋 Manifest:   ${[...CLOUD_EARNINGS_PATH, MANIFEST_NAME].join('/')}`);
+  console.log(`📁 音檔目錄:   ${LOCAL_AUDIO_DIR}`);
+  console.log(`📋 Manifest:   ${LOCAL_MANIFEST_PATH}`);
   console.log(`⚙️ 執行模式:   ${dryRun ? '預覽 (不會實際改名)' : '實際改名'}`);
 
-  const entries = await loadManifest();
+  const entries = loadEntries();
   console.log(`\n📋 manifest 共 ${entries.length} 場法說會\n`);
 
-  const audioFolderId = await GoogleDriveService.findFolderByPath(CLOUD_AUDIO_PATH);
-  if (!audioFolderId) {
-    throw new Error(`雲端找不到「${CLOUD_AUDIO_PATH.join('/')}」`);
+  if (!fs.existsSync(LOCAL_AUDIO_DIR)) {
+    throw new Error(`找不到音檔目錄「${LOCAL_AUDIO_DIR}」`);
   }
-  const files = await GoogleDriveService.listFolderFiles(audioFolderId);
-  const existingNames = new Set(files.map(f => f.name!));
+  const files = fs.readdirSync(LOCAL_AUDIO_DIR, { withFileTypes: true })
+    .filter(entry => entry.isFile())
+    .map(entry => entry.name)
+    .sort();
+  const existingNames = new Set(files);
 
   const stats = { total: files.length, renamed: 0, unchanged: 0, skipped: 0, failed: 0 };
 
-  for (const file of files) {
-    const fileName = file.name!;
+  for (const fileName of files) {
     const { entry, candidates } = matchEntry(fileName, entries);
 
     if (!entry) {
@@ -167,7 +161,7 @@ async function main(): Promise<void> {
 
     try {
       if (!dryRun) {
-        await GoogleDriveService.renameFile(file.id!, newName);
+        fs.renameSync(path.join(LOCAL_AUDIO_DIR, fileName), path.join(LOCAL_AUDIO_DIR, newName));
       }
       existingNames.delete(fileName);
       existingNames.add(newName);
