@@ -2,7 +2,7 @@ import { parseArgs } from 'util';
 import * as path from 'path';
 import * as fs from 'fs';
 import { GoogleDriveService } from './core/googleDrive';
-import { CLOUD_ROOT_FOLDER, EARNINGS_FOLDER } from './core/earnings';
+import { CLOUD_ROOT_FOLDER, EARNINGS_FOLDER, readSummaryVersion, summaryNameOf } from './core/earnings';
 
 
 function printHelp() {
@@ -20,7 +20,8 @@ function printHelp() {
   🧹 鏡像清理: 本地若已刪除報告，雲端對應檔案會移到垃圾桶
   📝 法說會摘要: 將 ./${EARNINGS_FOLDER}/<YYYYMM>/*.md 上傳至雲端同名月份資料夾，
                  雲端沒有或本地較新才上傳，同名檔案直接覆蓋 (不做鏡像刪除)；
-                 逐字稿、manifest、音檔只留在本地
+                 雲端已有對應摘要的 Colab 逐字稿 (.txt) 移到垃圾桶，摘要後又更新的逐字稿保留；
+                 本地的逐字稿、manifest、音檔不上傳
 =====================================================
 `);
 }
@@ -28,15 +29,17 @@ function printHelp() {
 interface EarningsUploadStats {
   uploaded: number;
   replaced: number;
+  transcriptsTrashed: number;
   failed: number;
 }
 
 /**
  * 上傳法說會摘要 (.md) 到雲端「投資報告/EarningsCall/<YYYYMM>」
- * 只上傳本地的摘要，不做鏡像刪除 (過期摘要由 clean:reports 依日期清理雲端)
+ * 只上傳本地的摘要，不做鏡像刪除 (過期摘要由 clean:reports 依日期清理雲端)；
+ * 雲端月份資料夾另有 Colab 產生的逐字稿，雲端已存在對應摘要者移到垃圾桶
  */
 async function uploadEarningsSummaries(localRoot: string, rootFolderId: string): Promise<EarningsUploadStats> {
-  const stats: EarningsUploadStats = { uploaded: 0, replaced: 0, failed: 0 };
+  const stats: EarningsUploadStats = { uploaded: 0, replaced: 0, transcriptsTrashed: 0, failed: 0 };
 
   const monthDirs = fs.readdirSync(localRoot, { withFileTypes: true })
     .filter(entry => entry.isDirectory() && /^\d{6}$/.test(entry.name))
@@ -53,12 +56,14 @@ async function uploadEarningsSummaries(localRoot: string, rootFolderId: string):
 
     const cloudFiles = await GoogleDriveService.listFolderFiles(folderId);
     const cloudMds = new Map(cloudFiles.filter(f => f.name?.endsWith('.md')).map(f => [f.name!, f]));
+    const syncedMds = new Set<string>();
 
     for (const name of localMds) {
       const localPath = path.join(localDir, name);
       const displayPath = `${EARNINGS_FOLDER}/${month}/${name}`;
       const cloudFile = cloudMds.get(name);
       if (cloudFile && GoogleDriveService.modifiedTimeMs(cloudFile) >= fs.statSync(localPath).mtimeMs) {
+        syncedMds.add(name);
         continue;
       }
       try {
@@ -71,6 +76,24 @@ async function uploadEarningsSummaries(localRoot: string, rootFolderId: string):
           stats.uploaded++;
           console.log(`📤 [上傳] ${displayPath}`);
         }
+        syncedMds.add(name);
+      } catch (err: any) {
+        stats.failed++;
+        console.error(`❌ [失敗] ${displayPath}: ${err.message}`);
+      }
+    }
+
+    // 雲端摘要已是該逐字稿版本 (或更新) 時，Colab 逐字稿不再需要，移到垃圾桶；
+    // 摘要後 Colab 又重做過的逐字稿較新，保留給下次摘要
+    for (const txt of cloudFiles.filter(f => f.name?.endsWith('.txt'))) {
+      const mdName = summaryNameOf(txt.name!);
+      if (!syncedMds.has(mdName)) continue;
+      if (readSummaryVersion(path.join(localDir, mdName)) < GoogleDriveService.modifiedTimeMs(txt)) continue;
+      const displayPath = `${EARNINGS_FOLDER}/${month}/${txt.name}`;
+      try {
+        await GoogleDriveService.trashFile(txt.id!);
+        stats.transcriptsTrashed++;
+        console.log(`🗑️ [移除逐字稿] ${displayPath}`);
       } catch (err: any) {
         stats.failed++;
         console.error(`❌ [失敗] ${displayPath}: ${err.message}`);
@@ -107,7 +130,7 @@ async function main() {
     process.exit(1);
   }
 
-  // 本地 EarningsCall 有逐字稿、manifest、音檔等不上傳的檔案，雲端只放摘要，不可鏡像同步
+  // 本地與雲端 EarningsCall 各有對方沒有的檔案 (本地逐字稿、Colab 逐字稿與 manifest 等)，不可鏡像同步
   if (path.basename(localPath) === EARNINGS_FOLDER) {
     console.error(`\n❌ 「${EARNINGS_FOLDER}」不能用 --dir 鏡像同步；法說會摘要會在同步後自動上傳。`);
     process.exit(1);
@@ -155,6 +178,7 @@ async function main() {
     }
     if (earningsStats) {
       console.log(`📝 法說會摘要: 上傳 ${earningsStats.uploaded}、覆蓋 ${earningsStats.replaced}` +
+        `、移除逐字稿 ${earningsStats.transcriptsTrashed}` +
         (earningsStats.failed > 0 ? `、失敗 ${earningsStats.failed}` : ''));
     }
     console.log('=====================================================');

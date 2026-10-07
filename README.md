@@ -18,7 +18,7 @@
 5. **Google Drive 鏡像同步**：
    * 研究報告增量上傳至雲端「投資報告」資料夾，本地刪除的檔案雲端同步移到垃圾桶。
 6. **法說會逐字稿與摘要**：
-   * 從公開資訊觀測站抓取法說會影音，交給 `agy`（雲端 Gemini）轉成逐字稿並產生 Markdown 摘要，本機不需要 GPU，摘要上傳雲端。
+   * 從公開資訊觀測站抓取法說會影音，轉成逐字稿（本機用 `agy` 雲端轉錄，或在 Google Colab 用 GPU 跑 faster-whisper），再用 `agy` 產生 Markdown 摘要並上傳雲端。
 7. **過期報告清理**：
    * 依檔名日期自動清除本地與雲端超過保留期限的報告、逐字稿與音檔。
 
@@ -52,7 +52,9 @@
 │   ├── summarize_earnings.ts  # 📝 法說會逐字稿摘要
 │   └── rename_earnings_audio.ts # 🏷️ 法說會音檔重新命名
 ├── scripts/
-│   └── transcribe_earnings.py # 🎙️ 法說會影音 → 逐字稿 (Python，以 uv 執行)
+│   └── transcribe_earnings.py # 🎙️ 法說會影音 → 逐字稿 (本機，agy 轉錄，以 uv 執行)
+├── colab/
+│   └── earnings_call_transcribe.ipynb # 🎙️ 法說會影音 → 逐字稿 (Google Colab GPU)
 ├── auth/                      # 🔐 各站點 Session 儲存目錄 (自動生成)
 ├── EquityReport/              # 📥 下載之個股研究報告 PDF (依站點分子目錄)
 ├── EarningsCall/              # 📝 法說會逐字稿與摘要 (<YYYYMM>/*.txt、*.md)、manifest.json、audio/
@@ -60,6 +62,7 @@
 ├── token.json                 # Google 授權 Token (首次授權後自動生成)
 ├── .env.example               # 環境變數範本
 ├── .env                       # 帳密設定檔 (自行建立)
+├── .gitattributes             # Notebook 輸出清除設定 (nbstripout)
 ├── package.json
 └── tsconfig.json
 ```
@@ -186,7 +189,7 @@ npm run upload:drive -- --dir <路徑>    # 指定要同步的本地目錄
 
 * **增量上傳**：雲端已有同名檔案則跳過。
 * **鏡像清理**：本地已刪除的報告，雲端對應檔案會移到垃圾桶。
-* **法說會摘要**：同時把 `./EarningsCall/<YYYYMM>/*.md` 上傳到雲端同名月份資料夾（雲端沒有或本地較新才上傳；月份資料夾不存在時自動建立）；逐字稿、`manifest.json`、音檔只留在本地。`EarningsCall` 不做鏡像刪除，也不能用 `--dir` 指定。
+* **法說會摘要**：同時把 `./EarningsCall/<YYYYMM>/*.md` 上傳到雲端同名月份資料夾（雲端沒有或本地較新才上傳；月份資料夾不存在時自動建立）；已有對應摘要的 Colab 雲端逐字稿 (`.txt`) 會移到垃圾桶。本地的逐字稿、`manifest.json`、音檔不上傳。`EarningsCall` 不做鏡像刪除，也不能用 `--dir` 指定。
 
 ---
 
@@ -195,14 +198,19 @@ npm run upload:drive -- --dir <路徑>    # 指定要同步的本地目錄
 整體流程：
 
 ```
-npm run transcribe:earnings ──► 本地 EarningsCall/<YYYYMM>/*.txt (逐字稿) + EarningsCall/manifest.json
+方式 A：npm run transcribe:earnings ──► 本地 EarningsCall/<YYYYMM>/*.txt + EarningsCall/manifest.json
+方式 B：Colab notebook             ──► 雲端 投資報告/EarningsCall/<YYYYMM>/*.txt + 雲端 manifest.json
        │
-npm run summarize:earnings  ──► 本地 EarningsCall/<YYYYMM>/*.md (摘要)
+npm run summarize:earnings  ──► 下載方式 B 的雲端逐字稿，產生本地 EarningsCall/<YYYYMM>/*.md (摘要)
        │
-npm run upload:drive        ──► 摘要上傳雲端 投資報告/EarningsCall/<YYYYMM>/ (逐字稿只留在本地)
+npm run upload:drive        ──► 摘要上傳雲端；已摘要的 Colab 雲端逐字稿移到垃圾桶
 ```
 
-### 1. 轉逐字稿 (`scripts/transcribe_earnings.py`)
+### 1. 轉逐字稿（兩種方式擇一）
+
+兩種方式各自記錄處理狀態（本地與雲端各一份 `manifest.json`），但都會跳過已有逐字稿或摘要的場次。**交替使用時，先執行 `summarize:earnings` 與 `upload:drive` 再換另一邊**，避免同一場被轉錄兩次。
+
+#### 方式 A：本機 + agy (`scripts/transcribe_earnings.py`)
 ```powershell
 npm run transcribe:earnings                                 # 處理當月 (台北時間)
 npm run transcribe:earnings -- --concurrency 1              # 遇到 agy 額度限制時降低同時轉寫段數
@@ -219,20 +227,43 @@ npm run transcribe:earnings -- --help                       # 所有參數
 * `--url` 的來源可為網址、Google Drive 分享連結（需設為「知道連結的任何人」可檢視）或本地檔案路徑，會優先於觀測站連結嘗試；場次代號或日期錯誤時會出現「不在本月清單」的警告。
 * YouTube 要求登入驗證時，加上 `--cookies <cookies.txt>` 或 `--cookies-from-browser firefox`。有安裝 Node.js 時會自動提供給 yt-dlp 解析 YouTube。
 
+#### 方式 B：Colab GPU (`colab/earnings_call_transcribe.ipynb`)
+1. 在 Google Colab 開啟 notebook，**執行階段 → 變更執行階段類型 → GPU**，執行階段版本選 `2026.07`（faster-whisper 需要 CUDA 12）。
+2. 在「設定」格調整月份、市場等參數後依序執行。notebook 會：
+   * 從公開資訊觀測站抓取當月法說會清單與影音連結（irconference、webpro、YouTube 等）。
+   * 下載音訊並以 faster-whisper 轉成繁體中文逐字稿，存到雲端 `投資報告/EarningsCall/<YYYYMM>/`。
+   * 以雲端的 `manifest.json` 記錄處理狀態，重跑時自動跳過已完成場次（雲端已有摘要的場次也會跳過），暫時性失敗會隔一段時間重試。
+3. 常用設定：
+
+| 設定 | 說明 |
+| :--- | :--- |
+| `YEAR`, `MONTH` | 要抓的月份，預設當月 |
+| `ONLY_CODES` | 只處理特定股票代號 |
+| `REDO_KEYS` | 強制重做的場次，格式 `代號_YYYYMMDD`，例如 `'2330_20261015'` |
+| `URL_OVERRIDES` | 手動指定影音網址（觀測站連結錯誤或 YouTube 被擋時），key 格式同樣為 `代號_YYYYMMDD`；支援 YouTube 與 Google Drive 分享連結（需設為「知道連結的任何人」可檢視） |
+| `YTDLP_COOKIES` | YouTube 要求登入驗證時，上傳 `cookies.txt` 並填入路徑 |
+
+> 若 `URL_OVERRIDES` 的 key 格式錯誤，清單格會出現「URL_OVERRIDES 中這些場次不在本月清單」的警告，覆寫網址不會生效。
+
+
 ### 2. 產生摘要
 ```powershell
 npm run summarize:earnings                        # 處理當月 (台北時間)
 npm run summarize:earnings -- --month 202609      # 指定月份
 npm run summarize:earnings -- --concurrency 1     # 遇到 agy 額度限制時降低同時處理數
 npm run summarize:earnings -- --force             # 已有摘要的場次也重新產生
+npm run summarize:earnings -- --local-only        # 不下載雲端 (Colab) 逐字稿
 ```
-比對本地逐字稿與摘要，只處理尚未摘要、或逐字稿在摘要後又更新過的場次。完成後執行 `npm run upload:drive` 上傳。
+先下載 Colab 寫入雲端的逐字稿（本地沒有或雲端較新者），再比對本地逐字稿與摘要，只處理尚未摘要、或逐字稿在摘要後又更新過的場次。完成後執行 `npm run upload:drive` 上傳。
 
 ### 3. 手動補抓的音檔
-無法自動下載的場次，把音檔放到本地 `EarningsCall/audio/`，統一命名為 `公司名稱(代號)-YYYYMMDD.副檔名` 後重跑 `transcribe:earnings`，會優先使用這些音檔：
+無法自動下載的場次，統一命名為 `公司名稱(代號)-YYYYMMDD.副檔名`：
+* 方式 A：放到本地 `EarningsCall/audio/` 後重跑 `transcribe:earnings`，會優先使用這些音檔。
+* 方式 B：放到雲端 `投資報告/EarningsCall/audio/`，分享連結填入 `URL_OVERRIDES`。
 ```powershell
-npm run rename:audio -- --dry-run    # 預覽 (依 manifest.json 比對公司與日期)
+npm run rename:audio -- --dry-run    # 預覽本地音檔改名 (依 manifest.json 比對公司與日期)
 npm run rename:audio                 # 實際改名
+npm run rename:audio -- --cloud      # 改名雲端 audio 資料夾 (同時參考 Colab 的 manifest)
 ```
 
 ---
@@ -247,8 +278,8 @@ npm run clean:reports -- --local-only  # 只清理本地
 ```
 
 * 以檔名前綴日期 (`YYYYMMDD_...`) 判斷，無日期的檔案保留並提示；`EarningsCall/audio/` 的音檔以檔名結尾的召開日期判斷。
-* 本地 `EarningsCall/manifest.json` 的過期紀錄一併移除。**請勿在 `transcribe:earnings` 執行期間清理**。
-* 雲端 `EarningsCall` 依相同規則移到垃圾桶（30 天內可復原）。
+* 本地與雲端 `EarningsCall/manifest.json` 的過期紀錄一併移除。**請勿在 `transcribe:earnings` 或 Colab 轉錄期間執行**。
+* 雲端 `EarningsCall` 的逐字稿、摘要、音檔依相同規則移到垃圾桶（30 天內可復原）。
 * 刪除後執行 `npm run upload:drive`，雲端 `EquityReport` 會同步清除。
 
 ---
@@ -289,3 +320,19 @@ export const SITES_REGISTRY: Record<string, () => SiteCrawler> = {
 };
 ```
 
+---
+
+## 🧑‍💻 開發備註：Notebook 輸出不進版控
+
+`.gitattributes` 設定以 [nbstripout](https://github.com/kynan/nbstripout) 作為 git filter，`.ipynb` 加入 git 時自動清除 cell 輸出與執行次數，重跑 notebook 不會產生多餘的 diff（本地檔案仍保留輸出）。
+
+filter 設定存在 `.git/config`，**每個 clone 需執行一次**（需安裝 [uv](https://docs.astral.sh/uv/)）：
+
+```powershell
+git config filter.nbstripout.clean "uvx nbstripout"
+git config filter.nbstripout.smudge cat
+git config filter.nbstripout.required true
+git config diff.ipynb.textconv "uvx nbstripout -t"
+```
+
+> 從 Colab 直接「在 GitHub 中儲存副本」不會經過此 filter，請在 Colab 開啟 **編輯 → 筆記本設定 → 儲存時省略程式碼儲存格輸出**。

@@ -4,7 +4,7 @@ import { google, drive_v3 } from 'googleapis';
 import { authenticate } from '@google-cloud/local-auth';
 
 // 設定 Google Drive 存取權限範圍
-// 需要完整 drive 權限：清理雲端時要處理先前由 Colab 或手動上傳的檔案，drive.file 只能讀寫本程式自己建立的檔案
+// 需要完整 drive 權限：法說會逐字稿與 manifest 由 Colab 寫入雲端硬碟，drive.file 只能讀寫本程式自己建立的檔案
 const SCOPES = [
   'https://www.googleapis.com/auth/drive',
 ];
@@ -222,6 +222,45 @@ export class GoogleDriveService {
    */
   public static modifiedTimeMs(file: drive_v3.Schema$File): number {
     return file.modifiedTime ? Date.parse(file.modifiedTime) : 0;
+  }
+
+  /**
+   * 下載雲端檔案到本地路徑
+   */
+  public static async downloadFile(fileId: string, destPath: string): Promise<void> {
+    const drive = await this.getClient();
+    const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
+    const tmpPath = `${destPath}.download`;
+    await new Promise<void>((resolve, reject) => {
+      const dest = fs.createWriteStream(tmpPath);
+      res.data.on('error', reject).pipe(dest).on('error', reject).on('finish', resolve);
+    });
+    fs.renameSync(tmpPath, destPath);
+  }
+
+  /**
+   * 以文字讀取雲端檔案內容 (例如 manifest.json)
+   */
+  public static async readFileText(fileId: string): Promise<string> {
+    const drive = await this.getClient();
+    const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'text' });
+    return res.data as unknown as string;
+  }
+
+  /**
+   * 以文字覆蓋雲端檔案內容 (保留檔案 ID 與分享設定)
+   */
+  public static async writeFileText(fileId: string, text: string, mimeType = 'application/json'): Promise<void> {
+    const drive = await this.getClient();
+    await drive.files.update({ fileId, media: { mimeType, body: text } });
+  }
+
+  /**
+   * 重新命名雲端檔案 (檔案 ID 與分享連結不變)
+   */
+  public static async renameFile(fileId: string, newName: string): Promise<void> {
+    const drive = await this.getClient();
+    await drive.files.update({ fileId, requestBody: { name: newName } });
   }
 
   /**

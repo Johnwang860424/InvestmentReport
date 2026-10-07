@@ -1,7 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { GoogleDriveService } from './googleDrive';
 
-// 雲端與本地共用的資料夾名稱 (須與 scripts/transcribe_earnings.py 一致)
+// 雲端與本地共用的資料夾名稱 (須與 scripts/transcribe_earnings.py、colab/earnings_call_transcribe.ipynb 一致)
 export const CLOUD_ROOT_FOLDER = '投資報告';
 export const EARNINGS_FOLDER = 'EarningsCall';
 export const CLOUD_EARNINGS_PATH = [CLOUD_ROOT_FOLDER, EARNINGS_FOLDER];
@@ -32,7 +33,7 @@ export function summaryNameOf(transcriptName: string): string {
   return transcriptName.replace(/\.txt$/, '.md');
 }
 
-/** transcribe_earnings.py 寫入 manifest.json 的單場法說會紀錄 */
+/** transcribe_earnings.py (本地) 或 Colab (雲端) 寫入 manifest.json 的單場法說會紀錄 */
 export interface ManifestEntry {
   code: string;
   name: string;
@@ -53,4 +54,11 @@ export function saveManifest(manifest: Manifest): void {
   const tmpPath = `${LOCAL_MANIFEST_PATH}.tmp`;
   fs.writeFileSync(tmpPath, JSON.stringify(manifest, null, 1), 'utf-8');
   fs.renameSync(tmpPath, LOCAL_MANIFEST_PATH);
+}
+
+/** 讀取雲端資料夾內 Colab 寫入的 manifest.json；檔案不存在時回傳 null */
+export async function loadCloudManifest(folderId: string): Promise<{ fileId: string; manifest: Manifest } | null> {
+  const fileId = (await GoogleDriveService.getFolderFilesMap(folderId)).get(MANIFEST_NAME);
+  if (!fileId) return null;
+  return { fileId, manifest: JSON.parse(await GoogleDriveService.readFileText(fileId)) };
 }
