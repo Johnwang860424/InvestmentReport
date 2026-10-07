@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import { GoogleDriveService } from './core/googleDrive';
 import { CLOUD_EARNINGS_PATH, EARNINGS_FOLDER, VERSION_LABEL, readSummaryVersion, summaryNameOf } from './core/earnings';
 
-const DEFAULT_MODEL = 'gemini-3.8-flash-high';
+const DEFAULT_MODEL = 'claude-opus-5-5-high';
 const AGY_TIMEOUT_MS = 15 * 60 * 1000;
 const MIN_TRANSCRIPT_CHARS = 500; // 逐字稿內文太短 (多半是靜音或下載到錯的影片) 就不摘要
 const MAX_CONSECUTIVE_FAILURES = 3;

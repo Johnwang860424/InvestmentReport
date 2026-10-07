@@ -1,6 +1,8 @@
 import { execSync } from 'child_process';
 import * as path from 'path';
 
+const CAPTCHA_MODEL = 'gemini-3.8-flash-high';
+
 export class CaptchaService {
   /**
    * 透過 agy CLI 進行圖片驗證碼視覺辨識
@@ -12,7 +14,7 @@ export class CaptchaService {
     try {
       const absPath = path.resolve(imagePath);
       const prompt = `請讀取 ${absPath} 這張圖片中的驗證碼，只輸出${expectedDigits}位數字結果，不要輸出任何其他說明文字或標點符號`;
-      const cmd = `agy --dangerously-skip-permissions -p "${prompt}"`;
+      const cmd = `agy --model ${CAPTCHA_MODEL} --dangerously-skip-permissions -p "${prompt}"`;
 
       const output = execSync(cmd, {
         encoding: 'utf8',
