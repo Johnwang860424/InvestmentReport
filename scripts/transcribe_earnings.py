@@ -1,8 +1,7 @@
 # /// script
-# requires-python = ">=3.10,<3.14"
+# requires-python = ">=3.10"
 # dependencies = [
 #   "beautifulsoup4",
-#   "faster-whisper>=1.1",
 #   "imageio-ffmpeg",
 #   "opencc-python-reimplemented",
 #   "requests",
@@ -15,7 +14,7 @@
 1. 從公開資訊觀測站 t100sb02_1 抓取指定月份（預設當月）的法說會清單
 2. 下載「影音連結資訊」中的影音（irconference mp4、webpro 串流、YouTube 及 yt-dlp 能解析的網站），
    或使用 ./EarningsCall/audio 內手動補抓的音檔
-3. 用 faster-whisper 轉成繁體中文逐字稿，存到 ./EarningsCall/<YYYYMM>/；轉錄時背景預先下載後面幾場
+3. 切成數段交給 agy (雲端 Gemini) 轉成繁體中文逐字稿，存到 ./EarningsCall/<YYYYMM>/；轉錄時背景預先下載後面幾場
 4. ./EarningsCall/manifest.json 記錄已處理的場次，重跑時自動跳過
    - 失敗分為「永久」（該連結不是影音、影片已刪除）與「暫時」（YouTube 驗證、網路問題），暫時性失敗隔一段時間自動重試
    - 公司之後補上新的影音連結時，會自動重新處理
@@ -23,7 +22,6 @@
 執行：npm run transcribe:earnings -- --help
 """
 import argparse
-import ctypes
 import datetime as dt
 import json
 import os
@@ -42,7 +40,12 @@ TODAY = dt.datetime.now(TZ).date()
 
 # ===== 預設設定 (多數可用命令列參數覆寫) =====
 MARKETS = ['sii', 'otc']                   # sii 上市、otc 上櫃、rotc 興櫃、pub 公開發行
-WHISPER_MODEL = 'large-v3-turbo'           # 記憶體不夠可改 'medium'
+AGY_MODEL = 'gemini-3.8-flash-high'        # 與 summarize_earnings.ts 相同；可用 agy models 查詢
+AGY_CONCURRENCY = 3                        # 同時交給 agy 轉寫幾段；遇到 agy 額度限制可調低為 1
+CHUNK_MINUTES = 10                         # 每段音檔長度 (分鐘)；太長 agy 容易逾時或漏段
+AGY_TIMEOUT_SECONDS = 15 * 60              # 單段轉寫逾時
+AGY_RETRIES = 1                            # 單段失敗時重試次數
+MAX_CONSECUTIVE_AGY_FAILURES = 3           # 連續幾場因 agy 失敗就停止 (多半是額度用完)
 DOWNLOAD_WORKERS = 2                       # 轉錄時，背景同時預先下載幾場；YouTube 常要求驗證時可調為 1
 MAX_ATTEMPTS = 5                           # 暫時性失敗（YouTube 驗證、網路逾時…）最多嘗試幾次；出現新連結時重新計算
 RETRY_AFTER_HOURS = 24                     # 暫時性失敗後，隔多久才再試
@@ -339,7 +342,10 @@ def download_gdrive(file_id, dest):
 def download_audio(url, stem, opts):
     """下載影音 (或讀取本地音檔) 並轉成 16kHz 單聲道 mp3，回傳暫存路徑。"""
     for f in WORK.glob(f'{stem}*'):
-        f.unlink()
+        if f.is_dir():
+            shutil.rmtree(f)
+        else:
+            f.unlink()
     if is_local(url):
         raw = Path(url)
         if not raw.is_file():
@@ -376,32 +382,14 @@ def download_audio(url, stem, opts):
     return out
 
 
-# ===== Whisper =====
+# ===== agy 轉錄 =====
 
-def preload_cuda_libs():
-    """載入 `npm run transcribe:earnings:gpu` 以 pip 安裝的 CUDA 12 / cuDNN 9 函式庫。
-    這些檔案不在系統搜尋路徑，CTranslate2 用檔名載入時找不到，先以完整路徑載入。"""
-    try:
-        import nvidia
-    except ImportError:
-        return
-    pattern = '*/bin/*.dll' if os.name == 'nt' else '*/lib/lib*.so*'
-    libs = sorted(p for base in nvidia.__path__ for p in Path(base).glob(pattern))
-    if os.name == 'nt':
-        for lib_dir in {str(p.parent) for p in libs}:
-            os.add_dll_directory(lib_dir)
-            os.environ['PATH'] = lib_dir + os.pathsep + os.environ.get('PATH', '')
-    # 函式庫之間有相依，載入失敗的下一輪再試
-    for _ in range(3):
-        failed = []
-        for lib in libs:
-            try:
-                ctypes.CDLL(str(lib), mode=getattr(ctypes, 'RTLD_GLOBAL', 0))
-            except OSError:
-                failed.append(lib)
-        if not failed or len(failed) == len(libs):
-            break
-        libs = failed
+class AgyError(RuntimeError):
+    """agy 執行失敗或輸出不是逐字稿；與影音連結無關，不把連結記為已嘗試。"""
+
+
+# 逐字稿行首時間：[mm:ss]、[h:mm:ss]，容許全形括號或沒有括號
+TS_LINE_RE = re.compile(r'^[\[【(（]?\s*(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\s*[\]】)）]?\s*[:：\-–]?\s*(.*)$')
 
 
 def fmt_ts(sec):
@@ -410,86 +398,126 @@ def fmt_ts(sec):
     return f'{h:02d}:{m:02d}:{s:02d}'
 
 
-class Transcriber:
-    def __init__(self, model_name, device):
-        preload_cuda_libs()
-        import ctranslate2
-        from faster_whisper import WhisperModel
+def parse_transcript(text, offset, length):
+    """解析 agy 輸出的 [mm:ss] 逐字稿，時間加上分段起點；回傳 [(秒, 文字)]。
+    第一個時間行之前的開場白捨棄，沒有時間的行沿用前一行的時間。"""
+    lines, last, started = [], 0, False
+    for raw in text.splitlines():
+        raw = raw.strip().strip('*').strip()
+        if not raw or raw.startswith('```'):
+            continue
+        m = TS_LINE_RE.match(raw)
+        if m:
+            h, mi, sec, body = m.groups()
+            # 時間不倒退、不超過分段長度 (模型偶爾標錯)
+            last = min(max(int(h or 0) * 3600 + int(mi) * 60 + int(sec), last), int(length))
+            started = True
+            raw = body.strip()
+        if started and raw:
+            lines.append((offset + last, raw))
+    if not started:
+        raise AgyError(f'agy 輸出不是 [mm:ss] 格式的逐字稿：{text.strip()[:150]}')
+    return lines
+
+
+class AgyTranscriber:
+    """把音檔切成 chunk_minutes 分鐘的段落，同時交給 agy (雲端 Gemini) 轉寫，再依時間合併。
+    單一檔案太長時 agy 容易逾時或漏段，因此分段處理。"""
+
+    def __init__(self, model, concurrency, chunk_minutes):
         from opencc import OpenCC
 
-        if device == 'auto':
-            device = 'cuda' if ctranslate2.get_cuda_device_count() > 0 else 'cpu'
-        print(f'載入 Whisper 模型 {model_name}（{device}；首次執行會先下載模型）...')
-        self.model = self._load(WhisperModel, model_name, device)
-        if device == 'cuda' and not self._cuda_works():
-            print('⚠️ GPU 無法使用（缺少 CUDA 12 / cuDNN 9 函式庫，可改用 npm run transcribe:earnings:gpu），改用 CPU')
-            device = 'cpu'
-            self.model = self._load(WhisperModel, model_name, device)
-        self.device = device
+        self.agy = shutil.which('agy')
+        if not self.agy:
+            sys.exit('❌ 找不到 agy，請先安裝 Antigravity CLI 並加入 PATH')
+        self.model = model
+        self.concurrency = concurrency
+        self.chunk_seconds = chunk_minutes * 60
         self.cc = OpenCC('s2twp')  # 保證輸出為台灣繁體
-        print('Whisper on', device)
+        print(f'🤖 轉錄模型: {model} (agy)，每 {chunk_minutes} 分鐘一段，同時處理 {concurrency} 段\n')
 
-    @staticmethod
-    def _load(cls, model_name, device):
-        if device == 'cuda':
-            return cls(model_name, device='cuda', compute_type='float16')
-        return cls(model_name, device='cpu', compute_type='int8', cpu_threads=os.cpu_count() or 4)
+    def split(self, audio_path):
+        """切成多段 mp3，回傳 [(路徑, 起點秒數, 長度秒數)]。"""
+        parts_dir = WORK / f'{audio_path.stem}_parts'
+        shutil.rmtree(parts_dir, ignore_errors=True)
+        parts_dir.mkdir(parents=True)
+        listing = parts_dir / 'parts.csv'
+        run([ffmpeg_exe(), '-y', '-loglevel', 'error', '-i', str(audio_path), '-f', 'segment',
+             '-segment_time', str(self.chunk_seconds), '-segment_list', str(listing),
+             '-segment_list_type', 'csv', '-c', 'copy', str(parts_dir / 'part_%03d.mp3')], timeout=600)
+        parts = []
+        for line in listing.read_text(encoding='utf-8').splitlines():
+            name, start, end = line.rsplit(',', 2)
+            parts.append((parts_dir / name, float(start), float(end) - float(start)))
+        if not parts:
+            raise RuntimeError('音檔切段失敗 (ffmpeg 沒有產生任何段落)')
+        return parts
 
-    def _cuda_works(self):
-        import numpy as np
-        try:
-            segments, _ = self.model.transcribe(np.zeros(16000, np.float32), language='zh')
-            list(segments)
-            return True
-        except Exception as e:  # cuBLAS / cuDNN 載入失敗時為 RuntimeError
-            print(f'   {short_error(str(e))}')
-            return False
-
-    @staticmethod
-    def load_audio(path, sr=16000):
-        """用 ffmpeg 解碼成 float32 陣列。
-        faster-whisper 內建用 PyAV 解碼，新版 av 移除了 metadata_errors 參數會直接報錯，因此改走 ffmpeg。"""
-        import numpy as np
-        p = subprocess.run([ffmpeg_exe(), '-nostdin', '-loglevel', 'error', '-i', str(path),
-                            '-f', 's16le', '-ac', '1', '-ar', str(sr), '-'],
-                           capture_output=True, check=True)
-        return np.frombuffer(p.stdout, np.int16).astype(np.float32) / 32768.0
-
-    def run_whisper(self, audio, ev, lang, strict):
-        """strict=False 時關閉 VAD 與靜音判斷：有些錄音（現場底噪、會議系統壓縮）是清楚的人聲，
-        卻被 VAD 或 no_speech 判斷整段濾掉，只剩幾百字。"""
-        opts = {} if strict else {'no_speech_threshold': None, 'log_prob_threshold': None}
-        segments, info = self.model.transcribe(
-            audio,
-            language=lang,
-            beam_size=5,
-            vad_filter=strict,
-            condition_on_previous_text=False,  # 降低長音檔的重複幻覺
-            initial_prompt=f'以下是{ev.name}法人說明會的逐字稿，內容包含營收、毛利率、展望等財務用語。',
-            **opts,
+    def prompt(self, part, out, ev, lang, index, total, length):
+        language = '英文原文，不要翻譯' if lang == 'en' else '台灣繁體中文'
+        return (
+            f'請聆聽 {part} 這個音檔，它是「{ev.code} {ev.name}」法人說明會錄音的第 {index}/{total} 段，'
+            f'長度約 {fmt_ts(length)}。請完整逐字轉寫：\n'
+            f'- 使用{language}，忠實記錄說話內容，不要摘要、改寫或省略；聽不清楚的地方標註「（聽不清）」。\n'
+            '- 內容包含營收、毛利率、展望等財務用語，公司名稱與專有名詞請依上下文判斷。\n'
+            '- 約每 30 秒到 1 分鐘換一行，行首標示該行在「這個音檔」中的開始時間，格式為 [mm:ss]，'
+            '例如：[03:15] 接下來說明第三季的營收狀況。\n'
+            '- 只寫逐字稿本文，不要開場白、結尾說明或 Markdown 標題。\n'
+            f'請用寫檔工具把逐字稿寫入 {out}，不要建立或修改其他檔案。'
         )
-        lines = []
-        for seg in segments:
-            text = seg.text.strip()
-            if text:
-                lines.append(f'[{fmt_ts(seg.start)}] {self.cc.convert(text) if lang == "zh" else text}')
-        return lines, info
+
+    def run_agy(self, part, ev, lang, index, total, length):
+        """轉寫一段；優先讀 agy 寫入的檔案 (部分 agy 版本非終端機執行時 stdout 為空)，否則用 stdout。"""
+        out = part.with_suffix('.txt')
+        cmd = [self.agy, '-p', self.prompt(part, out, ev, lang, index, total, length),
+               '--model', self.model, '--dangerously-skip-permissions', '--add-dir', str(part.parent)]
+        last_error = None
+        for attempt in range(AGY_RETRIES + 1):
+            out.unlink(missing_ok=True)
+            try:
+                # stdin 必須關閉，否則 agy 會等待終端機輸入而卡住
+                p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                   encoding='utf-8', errors='replace', timeout=AGY_TIMEOUT_SECONDS)
+                if p.returncode != 0:
+                    raise AgyError(f'agy 結束代碼 {p.returncode}：{(p.stderr or p.stdout).strip()[-300:]}')
+                text = out.read_text(encoding='utf-8') if out.exists() else ''
+                return parse_transcript(text if text.strip() else p.stdout, 0, length)
+            except subprocess.TimeoutExpired:
+                last_error = AgyError(f'agy 逾時 (超過 {AGY_TIMEOUT_SECONDS // 60} 分鐘)')
+            except AgyError as e:
+                last_error = e
+            if attempt < AGY_RETRIES:
+                time.sleep(10)
+        raise AgyError(f'第 {index}/{total} 段：{last_error}')
 
     def transcribe(self, audio_path, ev, url):
         lang = 'en' if re.search(r'_en\b', url) else 'zh'
-        audio = self.load_audio(audio_path)
-        lines, info = self.run_whisper(audio, ev, lang, strict=True)
-        if sum(map(len, lines)) < MIN_TRANSCRIPT_CHARS:
-            kept = getattr(info, 'duration_after_vad', None)
-            print(f'   ⚠️ 只辨識出 {sum(map(len, lines))} 字（VAD 保留 {fmt_ts(kept) if kept is not None else "?"}'
-                  f' / 全長 {fmt_ts(info.duration)}），關閉 VAD 與靜音判斷重跑')
-            lines, info = self.run_whisper(audio, ev, lang, strict=False)
+        parts = self.split(audio_path)
+        try:
+            with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
+                futures = [pool.submit(self.run_agy, part, ev, lang, i + 1, len(parts), length)
+                           for i, (part, _, length) in enumerate(parts)]
+                try:
+                    results = [f.result() for f in futures]
+                except BaseException:
+                    for f in futures:
+                        f.cancel()  # 有一段失敗就不再開始其餘段落，省下 agy 額度
+                    raise
+        finally:
+            shutil.rmtree(parts[0][0].parent, ignore_errors=True)
+
+        lines = []
+        for (_, start, _), result in zip(parts, results):
+            for sec, text in result:
+                lines.append(f'[{fmt_ts(start + sec)}] {self.cc.convert(text) if lang == "zh" else text}')
+        duration = parts[-1][1] + parts[-1][2]
         header = [
             f'公司：{ev.code} {ev.name}',
             f'日期：{ev.date_text} {ev.time}',
             f'摘要：{ev.summary}',
             f'來源：{url}',
-            f'長度：{fmt_ts(info.duration)}',
+            f'長度：{fmt_ts(duration)}',
+            f'轉錄模型：{self.model}',
             '',
         ]
         return '\n'.join(header + lines) + '\n'
@@ -545,6 +573,7 @@ def process(todo, manifest, manual, out_dir, transcriber, opts):
                 prefetched[i] = (url, pool.submit(download_audio, url, todo[i].stem, opts))
 
     stats = {'done': 0, 'failed': 0}
+    agy_failures = 0  # 連續因 agy 失敗的場次
     try:
         for i, ev in enumerate(todo):
             print(f'🎙️ ({i + 1}/{len(todo)}) {ev.stem}')
@@ -561,12 +590,15 @@ def process(todo, manifest, manual, out_dir, transcriber, opts):
             rec['last_attempt'] = dt.datetime.now(TZ).isoformat(timespec='seconds')
             rec['urls'] = ev.urls
             errors = []
+            succeeded = agy_failed = False
             for url in live_urls(rec, ev.urls):
                 try:
                     t0 = time.time()
                     audio = ahead.result() if url == ahead_url else download_audio(url, ev.stem, opts)
-                    text = transcriber.transcribe(audio, ev, url)
-                    audio.unlink()
+                    try:
+                        text = transcriber.transcribe(audio, ev, url)
+                    finally:
+                        audio.unlink(missing_ok=True)
                     body_chars = len(text.partition('\n\n')[2])
                     if body_chars < MIN_TRANSCRIPT_CHARS:
                         length = re.search(r'長度：(\S+)', text).group(1)
@@ -579,7 +611,13 @@ def process(todo, manifest, manual, out_dir, transcriber, opts):
                     rec.update(status='done', url=url, file=f'{out_dir.name}/{txt.name}',
                                updated=dt.datetime.now(TZ).isoformat(timespec='seconds'))
                     stats['done'] += 1
+                    succeeded = True
                     print(f'✅ {ev.stem}（{time.time() - t0:.0f}s）')
+                    break
+                except AgyError as e:
+                    # 不是連結的問題：不記為已嘗試 (下次執行直接重試)，也不改用備援連結浪費 agy 額度
+                    agy_failed = True
+                    errors.append(f'[agy] {url} → {short_error(str(e))[:300]}')
                     break
                 except Exception as e:
                     message = str(e)
@@ -590,13 +628,19 @@ def process(todo, manifest, manual, out_dir, transcriber, opts):
                         rec['dead_urls'] = list(dict.fromkeys(rec.get('dead_urls', []) + [url]))
                     # 每個連結各記一行關鍵錯誤，避免手動來源的錯誤被後面備援連結的訊息蓋掉
                     errors.append(f'[{"永久" if permanent else "暫時"}] {url} → {short_error(message)[:300]}')
-            else:
+            if not succeeded:
                 rec.update(status='failed', error='\n'.join(errors) or '無可用連結')
                 stats['failed'] += 1
                 print(f'❌ {ev.stem}')
                 for err in errors or ['無可用連結']:
                     print(f'   {err[:250]}')
             save_manifest(manifest)
+
+            agy_failures = agy_failures + 1 if agy_failed else 0
+            if agy_failures >= MAX_CONSECUTIVE_AGY_FAILURES:
+                print(f'\n⛔ 連續 {agy_failures} 場 agy 轉寫失敗，可能已達 agy 額度上限，停止執行；'
+                      '稍後重跑會從未完成的場次繼續。')
+                break
     finally:
         # 中斷時取消尚未開始的下載 (已開始的會跑完，殘留音檔下次下載同場時會先清掉)
         pool.shutdown(wait=False, cancel_futures=True)
@@ -624,7 +668,7 @@ def show_failed(manual):
 def parse_args():
     parser = argparse.ArgumentParser(
         prog='npm run transcribe:earnings --',
-        description='法說會影音 → 逐字稿：抓取公開資訊觀測站法說會影音，以 faster-whisper 轉成逐字稿存到 ./EarningsCall/<YYYYMM>/',
+        description='法說會影音 → 逐字稿：抓取公開資訊觀測站法說會影音，交給 agy (雲端 Gemini) 轉成逐字稿存到 ./EarningsCall/<YYYYMM>/',
         epilog='手動補抓的音檔放到 ./EarningsCall/audio/ 並命名為 公司名稱(代號)-YYYYMMDD.副檔名 (可用 npm run rename:audio)，'
                '會優先於觀測站連結使用。',
     )
@@ -638,9 +682,11 @@ def parse_args():
                         help='手動指定影音來源 (觀測站連結錯誤或 YouTube 被擋時)，優先於觀測站連結嘗試；'
                              '可為網址、Google Drive 分享連結或本地檔案路徑，可重複指定')
     parser.add_argument('--limit', '-n', type=int, help='本次最多處理幾場 (測試用)')
-    parser.add_argument('--model', default=WHISPER_MODEL, help=f'Whisper 模型 (預設: {WHISPER_MODEL})')
-    parser.add_argument('--device', choices=['auto', 'cuda', 'cpu'], default='auto',
-                        help='auto = 有 NVIDIA GPU 就用 GPU (預設)')
+    parser.add_argument('--model', default=AGY_MODEL, help=f'agy 模型 (預設: {AGY_MODEL})，可用 agy models 查詢')
+    parser.add_argument('--concurrency', '-c', type=int, default=AGY_CONCURRENCY,
+                        help=f'同時交給 agy 轉寫幾段 (預設: {AGY_CONCURRENCY})，遇到 agy 額度限制可調低為 1')
+    parser.add_argument('--chunk-minutes', type=int, default=CHUNK_MINUTES,
+                        help=f'每段音檔長度，分鐘 (預設: {CHUNK_MINUTES})')
     parser.add_argument('--download-workers', type=int, default=DOWNLOAD_WORKERS,
                         help=f'轉錄時背景預先下載幾場 (預設: {DOWNLOAD_WORKERS})')
     parser.add_argument('--cookies', help='YouTube 要求登入驗證時使用的 cookies.txt 路徑')
@@ -657,8 +703,9 @@ def parse_args():
         args.year, args.mon = TODAY.year, TODAY.month
     args.markets = [m.strip() for m in args.markets.split(',') if m.strip()]
     args.codes = {c.strip() for c in args.codes.split(',') if c.strip()}
-    if args.download_workers < 1:
-        parser.error('--download-workers 必須為正整數')
+    for flag in ('download_workers', 'concurrency', 'chunk_minutes'):
+        if getattr(args, flag) < 1:
+            parser.error(f'--{flag.replace("_", "-")} 必須為正整數')
     return args
 
 
@@ -694,7 +741,7 @@ def main():
         return
 
     t0 = time.time()
-    transcriber = Transcriber(args.model, args.device)
+    transcriber = AgyTranscriber(args.model, args.concurrency, args.chunk_minutes)
     stats = process(todo, manifest, manual, out_dir, transcriber, args)
 
     print('\n=====================================================')

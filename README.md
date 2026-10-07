@@ -18,7 +18,7 @@
 5. **Google Drive 鏡像同步**：
    * 研究報告增量上傳至雲端「投資報告」資料夾，本地刪除的檔案雲端同步移到垃圾桶。
 6. **法說會逐字稿與摘要**：
-   * 從公開資訊觀測站抓取法說會影音，在本地以 faster-whisper 轉成逐字稿（有 NVIDIA GPU 時自動使用），再用 `agy` 產生 Markdown 摘要並上傳雲端。
+   * 從公開資訊觀測站抓取法說會影音，交給 `agy`（雲端 Gemini）轉成逐字稿並產生 Markdown 摘要，本機不需要 GPU，摘要上傳雲端。
 7. **過期報告清理**：
    * 依檔名日期自動清除本地與雲端超過保留期限的報告、逐字稿與音檔。
 
@@ -75,7 +75,7 @@ npx playwright install chromium
 ```
 
 另需安裝：
-* Antigravity CLI (`agy`) 並加入 PATH，供驗證碼辨識與法說會摘要使用。
+* Antigravity CLI (`agy`) 並加入 PATH，供驗證碼辨識、法說會轉逐字稿與摘要使用。
 * [uv](https://docs.astral.sh/uv/)（`winget install astral-sh.uv`），供法說會轉逐字稿使用；Python 與套件會在首次執行時自動安裝，不需另外安裝 Python 或 ffmpeg。
 
 ### 2. 設定帳號密碼
@@ -204,8 +204,8 @@ npm run upload:drive        ──► 摘要上傳雲端 投資報告/EarningsCa
 
 ### 1. 轉逐字稿 (`scripts/transcribe_earnings.py`)
 ```powershell
-npm run transcribe:earnings                                 # 處理當月 (台北時間)，自動偵測 GPU
-npm run transcribe:earnings:gpu                             # NVIDIA 顯示卡：另外安裝 CUDA 12 / cuDNN 9 函式庫後執行
+npm run transcribe:earnings                                 # 處理當月 (台北時間)
+npm run transcribe:earnings -- --concurrency 1              # 遇到 agy 額度限制時降低同時轉寫段數
 npm run transcribe:earnings -- --month 202609               # 補抓指定月份
 npm run transcribe:earnings -- --codes 2330,2317            # 只處理特定股票代號
 npm run transcribe:earnings -- --redo 2330_20261015         # 強制重做 (可重複指定)
@@ -213,11 +213,9 @@ npm run transcribe:earnings -- --url 2330_20261015=<網址>   # 手動指定影�
 npm run transcribe:earnings -- --failed                     # 列出失敗場次與下次是否重試
 npm run transcribe:earnings -- --help                       # 所有參數
 ```
-* 從公開資訊觀測站抓取當月法說會清單與影音連結（irconference、webpro、YouTube 等），下載音訊並以 faster-whisper 轉成繁體中文逐字稿。
+* 從公開資訊觀測站抓取當月法說會清單與影音連結（irconference、webpro、YouTube 等），下載音訊後切成每 10 分鐘一段（`--chunk-minutes`），同時交給 `agy` 轉成繁體中文逐字稿，再依時間合併；預設模型與摘要相同，可用 `--model` 指定。
 * 以 `EarningsCall/manifest.json` 記錄處理狀態，重跑時自動跳過已完成場次（已有逐字稿或摘要的場次也會補登為完成），暫時性失敗會隔一段時間重試；可隨時 `Ctrl+C` 中斷，重跑從未完成的場次繼續。
-* 首次執行會下載 Whisper 模型（`large-v3-turbo` 約 1.6 GB）；記憶體不足或 CPU 太慢可加 `--model medium`。
-* **速度**：有 NVIDIA GPU 時一小時的法說會約 1～2 分鐘；只用 CPU 約需數分鐘到十幾分鐘（視 CPU 而定），場次多時建議讓它整晚執行。
-  * `transcribe:earnings:gpu` 會額外下載約 1 GB 的 CUDA 函式庫（只有第一次）；已自行安裝 CUDA 12 與 cuDNN 9 時用 `transcribe:earnings` 即可。GPU 無法使用時會自動改用 CPU 並提示。
+* **agy 額度**：一小時的法說會約 6 次 agy 呼叫，場次多的月份用量不小。agy 失敗（額度用完、逾時、輸出不是逐字稿）不會把影音連結記為失效，下次執行直接重試；連續 3 場因 agy 失敗會自動停止，稍後重跑即可。
 * `--url` 的來源可為網址、Google Drive 分享連結（需設為「知道連結的任何人」可檢視）或本地檔案路徑，會優先於觀測站連結嘗試；場次代號或日期錯誤時會出現「不在本月清單」的警告。
 * YouTube 要求登入驗證時，加上 `--cookies <cookies.txt>` 或 `--cookies-from-browser firefox`。有安裝 Node.js 時會自動提供給 yt-dlp 解析 YouTube。
 
