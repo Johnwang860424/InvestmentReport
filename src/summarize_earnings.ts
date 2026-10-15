@@ -32,6 +32,7 @@ function printHelp(): void {
   npm run summarize:earnings -- --concurrency <N>  同時摘要幾場 (預設: ${DEFAULT_CONCURRENCY})，遇到 agy 額度限制可調低為 1
   npm run summarize:earnings -- --force            已有摘要的場次也重新產生
   npm run summarize:earnings -- --local-only       不下載雲端 (Colab) 的逐字稿
+  npm run summarize:earnings -- --delete-transcript  摘要成功後刪除本地逐字稿 (之後無法 --force 重新摘要)
   npm run summarize:earnings -- --help             顯示此說明
 
 流程:
@@ -170,6 +171,7 @@ async function main(): Promise<void> {
     concurrency: { type: 'string' as const, short: 'c' },
     force: { type: 'boolean' as const, short: 'f' },
     'local-only': { type: 'boolean' as const },
+    'delete-transcript': { type: 'boolean' as const },
     help: { type: 'boolean' as const, short: 'h' },
   };
 
@@ -188,6 +190,7 @@ async function main(): Promise<void> {
   const concurrency = parsePositiveInt('--concurrency', values.concurrency, DEFAULT_CONCURRENCY);
   const model = values.model || DEFAULT_MODEL;
   const force = values.force === true;
+  const deleteTranscript = values['delete-transcript'] === true;
   const localDir = path.join(LOCAL_EARNINGS_ROOT, month);
 
   console.log('=====================================================');
@@ -199,9 +202,12 @@ async function main(): Promise<void> {
   if (force) {
     console.log('⚙️ 執行模式:   強制重新摘要');
   }
+  if (deleteTranscript) {
+    console.log('🗑️ 逐字稿:     摘要成功後刪除');
+  }
 
   const startTime = Date.now();
-  const stats = { summarized: 0, skipped: 0, failed: 0 };
+  const stats = { summarized: 0, skipped: 0, failed: 0, deleted: 0 };
 
   // 1. 下載 Colab 產生的雲端逐字稿；無法連線雲端時只處理本地逐字稿
   fs.mkdirSync(localDir, { recursive: true });
@@ -238,11 +244,16 @@ async function main(): Promise<void> {
     console.log(`🤖 [摘要中] (${index + 1}/${pending.length}) ${name}...`);
     try {
       // 先記下版本，摘要期間逐字稿若被重做，下次會再摘要
-      const version = new Date(transcriptVersionMs(txtPath)).toISOString();
-      fs.writeFileSync(mdPath, await summarize(txtPath, model, version), 'utf-8');
+      const versionMs = transcriptVersionMs(txtPath);
+      fs.writeFileSync(mdPath, await summarize(txtPath, model, new Date(versionMs).toISOString()), 'utf-8');
       stats.summarized++;
       consecutiveFailures = 0;
       console.log(`✅ [完成] ${path.basename(mdPath)} (${((Date.now() - t0) / 1000).toFixed(0)} 秒)`);
+      // 摘要期間被重做的逐字稿保留，下次重新摘要
+      if (deleteTranscript && transcriptVersionMs(txtPath) === versionMs) {
+        fs.rmSync(txtPath, { force: true });
+        stats.deleted++;
+      }
     } catch (err: any) {
       if (err instanceof SkipError) {
         stats.skipped++;
@@ -272,6 +283,9 @@ async function main(): Promise<void> {
   console.log('=====================================================');
   console.log(`⏱️  耗時:       ${duration} 秒`);
   console.log(`🤖 新增摘要:   ${stats.summarized}`);
+  if (deleteTranscript) {
+    console.log(`🗑️ 刪除逐字稿: ${stats.deleted}`);
+  }
   if (stats.skipped > 0) {
     console.log(`⏩ 逐字稿過短: ${stats.skipped}`);
   }

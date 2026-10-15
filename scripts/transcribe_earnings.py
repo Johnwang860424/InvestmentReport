@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -45,8 +46,9 @@ AGY_MODEL = 'gemini-3.8-flash-high'        # 與 summarize_earnings.ts 相同；
 AGY_CONCURRENCY = 3                        # 同時交給 agy 轉寫幾段；遇到 agy 額度限制可調低為 1
 CHUNK_MINUTES = 10                         # 每段音檔長度 (分鐘)；太長 agy 容易逾時或漏段
 AGY_TIMEOUT_SECONDS = 15 * 60              # 單段轉寫逾時
-AGY_RETRIES = 1                            # 單段失敗時重試次數
+AGY_RETRIES = 2                            # 單段失敗時重試次數
 MAX_CONSECUTIVE_AGY_FAILURES = 3           # 連續幾場因 agy 失敗就停止 (多半是額度用完)
+AGY_QUOTA_MAX_WAIT_MINUTES = 60            # agy 額度用完 (429) 時，重置時間在此之內就等待後繼續，否則停止執行
 DOWNLOAD_WORKERS = 2                       # 轉錄時，背景同時預先下載幾場；YouTube 常要求驗證時可調為 1
 MAX_ATTEMPTS = 5                           # 暫時性失敗（YouTube 驗證、網路逾時…）最多嘗試幾次；出現新連結時重新計算
 RETRY_AFTER_HOURS = 24                     # 暫時性失敗後，隔多久才再試
@@ -516,6 +518,19 @@ class AgyError(RuntimeError):
     """agy 執行失敗或輸出不是逐字稿；與影音連結無關，不把連結記為已嘗試。"""
 
 
+class AgyQuotaError(AgyError):
+    """agy 額度用完 (429)，且重置時間太久或無法得知，不值得等待；停止本次執行。"""
+
+
+def quota_reset_seconds(message):
+    """agy 額度用完 (429) 時回傳距離重置的秒數 (讀不到時間為 0)；不是額度錯誤回傳 None。"""
+    if not re.search(r'RESOURCE_EXHAUSTED|code 429|quota reached', message, re.I):
+        return None
+    m = re.search(r'Resets in ((?:\d+\s*[hms]\s*)+)', message)
+    units = {'h': 3600, 'm': 60, 's': 1}
+    return sum(int(n) * units[u] for n, u in re.findall(r'(\d+)\s*([hms])', m.group(1))) if m else 0
+
+
 # 逐字稿行首時間：[mm:ss]、[h:mm:ss]，容許全形括號或沒有括號
 TS_LINE_RE = re.compile(r'^[\[【(（]?\s*(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\s*[\]】)）]?\s*[:：\-–]?\s*(.*)$')
 
@@ -548,6 +563,30 @@ def parse_transcript(text, offset, length):
     return lines
 
 
+# agy --json-schema：強制最後的回答是這個結構，不必依賴 agy 寫檔或從 stdout 的思考過程裡找逐字稿
+TRANSCRIPT_SCHEMA = json.dumps({
+    'type': 'object',
+    'properties': {'lines': {'type': 'array', 'items': {
+        'type': 'object',
+        'properties': {'time': {'type': 'string'}, 'text': {'type': 'string'}},
+        'required': ['time', 'text'],
+    }}},
+    'required': ['lines'],
+}, separators=(',', ':'))
+
+
+def structured_transcript(stdout):
+    """從 agy --output-format json 的輸出取出 structured_output，轉成 [mm:ss] 逐字稿文字。"""
+    try:
+        result = json.loads(stdout)
+        rows = result['structured_output']['lines']
+    except (ValueError, KeyError, TypeError):
+        raise AgyError(f'agy 沒有回傳逐字稿 JSON：{stdout.strip()[:150]}')
+    if result.get('status') != 'SUCCESS' or not rows:
+        raise AgyError(f'agy 狀態 {result.get("status")}，逐字稿 {len(rows)} 行：{str(result.get("response"))[:150]}')
+    return '\n'.join(f'[{r["time"]}] {r["text"]}' for r in rows)
+
+
 class AgyTranscriber:
     """把音檔切成 chunk_minutes 分鐘的段落，同時交給 agy (雲端 Gemini) 轉寫，再依時間合併。
     單一檔案太長時 agy 容易逾時或漏段，因此分段處理。"""
@@ -562,6 +601,8 @@ class AgyTranscriber:
         self.concurrency = concurrency
         self.chunk_seconds = chunk_minutes * 60
         self.cc = OpenCC('s2twp')  # 保證輸出為台灣繁體
+        self.quota_lock = threading.Lock()
+        self.resume_at = 0.0  # agy 額度重置的時間 (time.time())，之前所有段落都暫停呼叫 agy
         print(f'🤖 轉錄模型: {model} (agy)，每 {chunk_minutes} 分鐘一段，同時處理 {concurrency} 段\n')
 
     def split(self, audio_path):
@@ -581,40 +622,59 @@ class AgyTranscriber:
             raise RuntimeError('音檔切段失敗 (ffmpeg 沒有產生任何段落)')
         return parts
 
-    def prompt(self, part, out, ev, lang, index, total, length):
+    def prompt(self, part, ev, lang, index, total, length):
         language = '英文原文，不要翻譯' if lang == 'en' else '台灣繁體中文'
         return (
             f'請聆聽 {part} 這個音檔，它是「{ev.code} {ev.name}」法人說明會錄音的第 {index}/{total} 段，'
             f'長度約 {fmt_ts(length)}。請完整逐字轉寫：\n'
             f'- 使用{language}，忠實記錄說話內容，不要摘要、改寫或省略；聽不清楚的地方標註「（聽不清）」。\n'
             '- 內容包含營收、毛利率、展望等財務用語，公司名稱與專有名詞請依上下文判斷。\n'
-            '- 約每 30 秒到 1 分鐘換一行，行首標示該行在「這個音檔」中的開始時間，格式為 [mm:ss]，'
-            '例如：[03:15] 接下來說明第三季的營收狀況。\n'
-            '- 只寫逐字稿本文，不要開場白、結尾說明或 Markdown 標題。\n'
-            f'請用寫檔工具把逐字稿寫入 {out}，不要建立或修改其他檔案。'
+            '- 約每 30 秒到 1 分鐘一行，time 為該行在「這個音檔」中的開始時間 (mm:ss)，text 為該行逐字稿。\n'
+            '- 音檔已經切好，直接讀取整個音檔轉寫；不要切割、轉換音檔，不要執行任何終端機指令，也不要建立任何檔案。'
         )
 
+    def wait_for_quota(self, reset=0):
+        """額度用完時記下重置時間 (多加 30 秒緩衝)；所有段落在重置前都先等待，不再呼叫 agy。"""
+        with self.quota_lock:
+            if reset and time.time() + reset + 30 > self.resume_at + 60:  # 同一次額度用完只提示一次
+                self.resume_at = time.time() + reset + 30
+                print(f'   ⏳ agy 額度用完，等待 {fmt_ts(reset + 30)} 額度重置後繼續…', flush=True)
+            remaining = self.resume_at - time.time()
+        if remaining > 0:
+            time.sleep(remaining)
+
     def run_agy(self, part, ev, lang, index, total, length):
-        """轉寫一段；優先讀 agy 寫入的檔案 (部分 agy 版本非終端機執行時 stdout 為空)，否則用 stdout。"""
-        out = part.with_suffix('.txt')
-        cmd = [self.agy, '-p', self.prompt(part, out, ev, lang, index, total, length),
-               '--model', self.model, '--dangerously-skip-permissions', '--add-dir', str(part.parent)]
+        """轉寫一段。--sandbox 禁止 agy 執行終端機指令 (避免它自己切檔、轉檔)，
+        --json-schema 強制結構化輸出，只讀最後的 structured_output，不受中間思考過程與工具呼叫影響。"""
+        cmd = [self.agy, '-p', self.prompt(part, ev, lang, index, total, length),
+               '--model', self.model, '--dangerously-skip-permissions', '--add-dir', str(part.parent),
+               '--sandbox', '--output-format', 'json', '--json-schema', TRANSCRIPT_SCHEMA]
         last_error = None
-        for attempt in range(AGY_RETRIES + 1):
-            out.unlink(missing_ok=True)
+        attempt = 0
+        while attempt <= AGY_RETRIES:
+            self.wait_for_quota()
             try:
                 # stdin 必須關閉，否則 agy 會等待終端機輸入而卡住
                 p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                                    encoding='utf-8', errors='replace', timeout=AGY_TIMEOUT_SECONDS)
                 if p.returncode != 0:
-                    raise AgyError(f'agy 結束代碼 {p.returncode}：{(p.stderr or p.stdout).strip()[-300:]}')
-                text = out.read_text(encoding='utf-8') if out.exists() else ''
-                return parse_transcript(text if text.strip() else p.stdout, 0, length)
+                    output = (p.stderr or p.stdout).strip()
+                    reset = quota_reset_seconds(output)
+                    if reset is not None:
+                        if not reset or reset > AGY_QUOTA_MAX_WAIT_MINUTES * 60:
+                            raise AgyQuotaError(f'agy 額度用完：{output[-300:]}')
+                        self.wait_for_quota(reset)
+                        continue  # 額度重置後重跑這段，不算一次重試
+                    raise AgyError(f'agy 結束代碼 {p.returncode}：{output[-300:]}')
+                return parse_transcript(structured_transcript(p.stdout), 0, length)
             except subprocess.TimeoutExpired:
                 last_error = AgyError(f'agy 逾時 (超過 {AGY_TIMEOUT_SECONDS // 60} 分鐘)')
+            except AgyQuotaError:
+                raise
             except AgyError as e:
                 last_error = e
-            if attempt < AGY_RETRIES:
+            attempt += 1
+            if attempt <= AGY_RETRIES:
                 time.sleep(10)
         raise AgyError(f'第 {index}/{total} 段：{last_error}')
 
@@ -718,7 +778,7 @@ def process(todo, manifest, manual, out_dir, transcriber, opts):
             rec['last_attempt'] = dt.datetime.now(TZ).isoformat(timespec='seconds')
             rec['urls'] = ev.urls
             errors = []
-            succeeded = agy_failed = False
+            succeeded = agy_failed = quota_exhausted = False
             for url in live_urls(rec, ev.urls):
                 try:
                     t0 = time.time()
@@ -745,7 +805,9 @@ def process(todo, manifest, manual, out_dir, transcriber, opts):
                 except AgyError as e:
                     # 不是連結的問題：不記為已嘗試 (下次執行直接重試)，也不改用備援連結浪費 agy 額度
                     agy_failed = True
-                    errors.append(f'[agy] {url} → {short_error(str(e))[:300]}')
+                    quota_exhausted = isinstance(e, AgyQuotaError)
+                    # agy 錯誤的原因在第一行，後面才是 agy 輸出；合併成一行保留原因，不能用 short_error 取最後一行
+                    errors.append(f'[agy] {url} → {" ".join(str(e).split())[:300]}')
                     break
                 except Exception as e:
                     message = str(e)
@@ -764,6 +826,10 @@ def process(todo, manifest, manual, out_dir, transcriber, opts):
                     print(f'   {err[:250]}')
             save_manifest(manifest)
 
+            if quota_exhausted:
+                print(f'\n⛔ agy 額度用完，且重置時間超過 {AGY_QUOTA_MAX_WAIT_MINUTES} 分鐘或無法得知，停止執行；'
+                      '額度重置後重跑會從未完成的場次繼續。')
+                break
             agy_failures = agy_failures + 1 if agy_failed else 0
             if agy_failures >= MAX_CONSECUTIVE_AGY_FAILURES:
                 print(f'\n⛔ 連續 {agy_failures} 場 agy 轉寫失敗，可能已達 agy 額度上限，停止執行；'

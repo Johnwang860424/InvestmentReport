@@ -227,7 +227,7 @@ npm run transcribe:earnings -- --help                       # 所有參數
 ```
 * 從公開資訊觀測站抓取當月法說會清單與影音連結（irconference、webpro、YouTube 等），下載音訊後切成每 10 分鐘一段（`--chunk-minutes`），同時交給 `agy` 轉成繁體中文逐字稿，再依時間合併；預設模型與摘要相同，可用 `--model` 指定。
 * 依共用的 `manifest.json` 自動跳過已完成場次（本地已有逐字稿或摘要的場次也會補登為完成），暫時性失敗會隔一段時間重試；可隨時 `Ctrl+C` 中斷，重跑從未完成的場次繼續。
-* **agy 額度**：一小時的法說會約 6 次 agy 呼叫，場次多的月份用量不小。agy 失敗（額度用完、逾時、輸出不是逐字稿）不會把影音連結記為失效，下次執行直接重試；連續 3 場因 agy 失敗會自動停止，稍後重跑即可。
+* **agy 額度**：一小時的法說會約 6 次 agy 呼叫，場次多的月份用量不小。agy 失敗（額度用完、逾時、輸出不是逐字稿）不會把影音連結記為失效，下次執行直接重試；遇到額度用完 (429) 時，若 60 分鐘內會重置就自動等待後繼續，否則立即停止；連續 3 場因 agy 其他原因失敗也會自動停止，稍後重跑即可。
 * `--url` 的來源可為網址、Google Drive 分享連結（需設為「知道連結的任何人」可檢視）或本地檔案路徑，會優先於觀測站連結嘗試；場次代號或日期錯誤時會出現「不在本月清單」的警告。
 * YouTube 要求登入驗證時，加上 `--cookies <cookies.txt>` 或 `--cookies-from-browser firefox`。有安裝 Node.js 時會自動提供給 yt-dlp 解析 YouTube。
 
@@ -257,8 +257,11 @@ npm run summarize:earnings -- --month 202609      # 指定月份
 npm run summarize:earnings -- --concurrency 1     # 遇到 agy 額度限制時降低同時處理數
 npm run summarize:earnings -- --force             # 已有摘要的場次也重新產生
 npm run summarize:earnings -- --local-only        # 不下載雲端 (Colab) 逐字稿
+npm run summarize:earnings -- --delete-transcript # 摘要成功後刪除本地逐字稿
 ```
 先下載 Colab 寫入雲端的逐字稿（本地沒有或雲端較新者），再比對本地逐字稿與摘要，只處理尚未摘要、或逐字稿在摘要後又更新過的場次。完成後執行 `npm run upload:drive` 上傳。
+
+`--delete-transcript` 只刪除摘要成功的本地 `.txt`（失敗、過短或摘要期間被重做的保留）。已摘要的場次不會再從雲端下載或重新轉錄；但雲端的 Colab 逐字稿在 `upload:drive` 後也會移到垃圾桶，刪除後就無法用 `--force` 或換模型重新摘要。
 
 ### 3. 手動補抓的音檔
 無法自動下載的場次，統一命名為 `公司名稱(代號)-YYYYMMDD.副檔名`：
