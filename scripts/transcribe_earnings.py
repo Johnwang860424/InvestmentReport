@@ -544,6 +544,8 @@ def fmt_ts(sec):
 def parse_transcript(text, offset, length):
     """解析 agy 輸出的 [mm:ss] 逐字稿，時間加上分段起點；回傳 [(秒, 文字)]。
     第一個時間行之前的開場白捨棄，沒有時間的行沿用前一行的時間。"""
+    if not text.strip():
+        return []
     lines, last, started = [], 0, False
     for raw in text.splitlines():
         raw = raw.strip().strip('*').strip()
@@ -582,8 +584,8 @@ def structured_transcript(stdout):
         rows = result['structured_output']['lines']
     except (ValueError, KeyError, TypeError):
         raise AgyError(f'agy 沒有回傳逐字稿 JSON：{stdout.strip()[:150]}')
-    if result.get('status') != 'SUCCESS' or not rows:
-        raise AgyError(f'agy 狀態 {result.get("status")}，逐字稿 {len(rows)} 行：{str(result.get("response"))[:150]}')
+    if result.get('status') != 'SUCCESS':
+        raise AgyError(f'agy 狀態 {result.get("status")}：{str(result.get("response"))[:150]}')
     return '\n'.join(f'[{r["time"]}] {r["text"]}' for r in rows)
 
 
@@ -620,6 +622,10 @@ class AgyTranscriber:
             parts.append((parts_dir / name, float(start), float(end) - float(start)))
         if not parts:
             raise RuntimeError('音檔切段失敗 (ffmpeg 沒有產生任何段落)')
+        if len(parts) > 1 and parts[-1][2] < 3.0:
+            # 結尾不足 3 秒的零碎片段通常是切段邊界的微小殘餘 (例如 0.19 秒)，略過以節省 agy 額度
+            discarded = parts.pop()
+            discarded[0].unlink(missing_ok=True)
         return parts
 
     def prompt(self, part, ev, lang, index, total, length):
