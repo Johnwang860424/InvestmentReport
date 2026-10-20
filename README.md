@@ -257,11 +257,11 @@ npm run summarize:earnings -- --month 202609      # 指定月份
 npm run summarize:earnings -- --concurrency 1     # 遇到 agy 額度限制時降低同時處理數
 npm run summarize:earnings -- --force             # 已有摘要的場次也重新產生
 npm run summarize:earnings -- --local-only        # 不下載雲端 (Colab) 逐字稿
-npm run summarize:earnings -- --delete-transcript # 摘要成功後刪除本地逐字稿
+npm run summarize:earnings -- --delete-transcript # 刪除已摘要的本地逐字稿
 ```
 先下載 Colab 寫入雲端的逐字稿（本地沒有或雲端較新者），再比對本地逐字稿與摘要，只處理尚未摘要、或逐字稿在摘要後又更新過的場次。完成後執行 `npm run upload:drive` 上傳。
 
-`--delete-transcript` 只刪除摘要成功的本地 `.txt`（失敗、過短或摘要期間被重做的保留）。已摘要的場次不會再從雲端下載或重新轉錄；但雲端的 Colab 逐字稿在 `upload:drive` 後也會移到垃圾桶，刪除後就無法用 `--force` 或換模型重新摘要。
+`--delete-transcript` 刪除摘要成功、以及先前就已摘要過最新版本的本地 `.txt`（失敗、過短、尚未摘要或摘要期間被重做的保留），因此事後補帶此參數也能清掉舊逐字稿。已摘要的場次不會再從雲端下載或重新轉錄；但雲端的 Colab 逐字稿在 `upload:drive` 後也會移到垃圾桶，刪除後就無法用 `--force` 或換模型重新摘要。
 
 ### 3. 手動補抓的音檔
 無法自動下載的場次，統一命名為 `公司名稱(代號)-YYYYMMDD.副檔名`：

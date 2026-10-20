@@ -32,7 +32,7 @@ function printHelp(): void {
   npm run summarize:earnings -- --concurrency <N>  同時摘要幾場 (預設: ${DEFAULT_CONCURRENCY})，遇到 agy 額度限制可調低為 1
   npm run summarize:earnings -- --force            已有摘要的場次也重新產生
   npm run summarize:earnings -- --local-only       不下載雲端 (Colab) 的逐字稿
-  npm run summarize:earnings -- --delete-transcript  摘要成功後刪除本地逐字稿 (之後無法 --force 重新摘要)
+  npm run summarize:earnings -- --delete-transcript  刪除已摘要的本地逐字稿，含先前已摘要者 (之後無法 --force 重新摘要)
   npm run summarize:earnings -- --help             顯示此說明
 
 流程:
@@ -152,7 +152,7 @@ async function summarize(txtPath: string, model: string, transcriptVersion: stri
   return `# ${name} 法說會摘要\n\n${meta}\n\n${summary}\n`;
 }
 
-class SkipError extends Error {}
+class SkipError extends Error { }
 
 function parsePositiveInt(flag: string, value: string | undefined, fallback: number): number {
   if (value === undefined) return fallback;
@@ -203,7 +203,7 @@ async function main(): Promise<void> {
     console.log('⚙️ 執行模式:   強制重新摘要');
   }
   if (deleteTranscript) {
-    console.log('🗑️ 逐字稿:     摘要成功後刪除');
+    console.log('🗑️ 逐字稿:     已摘要者刪除');
   }
 
   const startTime = Date.now();
@@ -223,12 +223,21 @@ async function main(): Promise<void> {
 
   // 2. 比對逐字稿與摘要，找出待摘要場次
   const txts = fs.readdirSync(localDir).filter(name => name.endsWith('.txt')).sort();
-  const pending = txts
-    .filter(name => force
-      || readSummaryVersion(path.join(localDir, summaryNameOf(name))) < transcriptVersionMs(path.join(localDir, name)))
-    .slice(0, limit);
+  const isSummarized = (name: string): boolean =>
+    readSummaryVersion(path.join(localDir, summaryNameOf(name))) >= transcriptVersionMs(path.join(localDir, name));
+  const pending = txts.filter(name => force || !isSummarized(name)).slice(0, limit);
 
   console.log(`\n🤖 共有 ${txts.length} 份逐字稿，待摘要 ${pending.length} 場\n`);
+
+  // 先前已摘要過最新版本的逐字稿 (例如當時沒帶 --delete-transcript) 也一併刪除
+  if (deleteTranscript) {
+    for (const name of txts) {
+      if (pending.includes(name) || !isSummarized(name)) continue;
+      fs.rmSync(path.join(localDir, name), { force: true });
+      stats.deleted++;
+      console.log(`🗑️ [刪除已摘要的逐字稿] ${name}`);
+    }
+  }
 
   // 3. 同時處理 concurrency 場
   //    連續失敗達上限時不再開始新場次，進行中的場次會跑完
