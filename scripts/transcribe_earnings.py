@@ -321,6 +321,14 @@ def apply_manual_sources(manual, key, urls):
     return list(dict.fromkeys(manual.get(key, []) + urls))
 
 
+def revive_manual_sources(manifest, manual):
+    """手動指定的來源即使之前被標為失效 (例如與觀測站連結相同) 也要再試，從 dead_urls 移除。"""
+    for key, urls in manual.items():
+        rec = manifest.get(key)
+        if rec and rec.get('dead_urls'):
+            rec['dead_urls'] = [u for u in rec['dead_urls'] if u not in urls]
+
+
 # ===== 抓取法說會清單 =====
 
 BASE = 'https://mopsov.twse.com.tw/mops/web'
@@ -442,6 +450,12 @@ def resolve_url(url):
         m = re.search(r'https://webprovod\.twse\.com\.tw/[^"\\\s]+?playlist\.m3u8', html)
         if m:
             return m.group(0)
+    if 'itvcloud.org' in url:
+        # iTV Cloud 影音雲：影片網址寫在頁面 JSON 的 path 欄位；yt-dlp 直接解析頁面會抓到縮圖網址而 404
+        html = http().get(url, timeout=60).text
+        m = re.search(r'"path"\s*:\s*"(https?://[^"]+?\.m3u8)"', html)
+        if m:
+            return m.group(1)
     return url
 
 
@@ -726,7 +740,10 @@ def plan(events, manifest, out_dir, redo_keys, limit):
     for ev in events:
         txt = out_dir / f'{ev.stem}.txt'
         if ev.key in redo_keys:
-            manifest.pop(ev.key, None)  # 強制重做：清掉舊紀錄，成功後覆蓋舊逐字稿
+            # 強制重做：換成全新紀錄，成功後覆蓋舊逐字稿。不能直接刪除紀錄，
+            # 否則存檔時與雲端合併會把舊的失敗紀錄 (含 dead_urls) 加回來；新紀錄的時間較新，合併時不會被蓋掉
+            manifest[ev.key] = {'code': ev.code, 'name': ev.name, 'date': str(ev.date),
+                                'last_attempt': dt.datetime.now(TZ).isoformat(timespec='seconds')}
         elif manifest.get(ev.key, {}).get('status') == 'done':
             counts['已完成'] += 1
             continue
@@ -740,7 +757,7 @@ def plan(events, manifest, out_dir, redo_keys, limit):
         if ev.date > TODAY or not ev.urls:
             counts['尚未召開或無影音'] += 1
             continue  # 下次再試
-        blocker = retry_blocker(manifest.get(ev.key, {}), ev.urls)
+        blocker = None if ev.key in redo_keys else retry_blocker(manifest.get(ev.key, {}), ev.urls)
         if blocker:
             counts['等待重試' if blocker.endswith('後重試') else '放棄'] += 1
             continue
@@ -849,7 +866,9 @@ def process(todo, manifest, manual, out_dir, transcriber, opts):
 
 def show_failed(manual):
     """列出 manifest 中失敗的場次，以及下次執行會不會重試。"""
-    failed = {k: v for k, v in load_manifest().items() if v.get('status') == 'failed'}
+    manifest = load_manifest()
+    revive_manual_sources(manifest, manual)
+    failed = {k: v for k, v in manifest.items() if v.get('status') == 'failed'}
     if not failed:
         print('沒有失敗的場次')
         return
@@ -936,6 +955,7 @@ def main():
     events = fetch_events(args.year, args.mon, args.markets, args.codes, manual, cli_keys)
 
     manifest = load_manifest()
+    revive_manual_sources(manifest, manual)
     _prune_month = (args.year, args.mon)
     pruned = prune_manifest(manifest, args.year, args.mon)
     todo, backfilled = plan(events, manifest, out_dir, set(args.redo), args.limit)
