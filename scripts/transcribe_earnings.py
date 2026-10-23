@@ -32,9 +32,11 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo('Asia/Taipei')
@@ -456,7 +458,31 @@ def resolve_url(url):
         m = re.search(r'"path"\s*:\s*"(https?://[^"]+?\.m3u8)"', html)
         if m:
             return m.group(1)
+    if 'showroom.one.blendvision.com' in url:
+        return blendvision_manifest(url)
     return url
+
+
+def blendvision_manifest(url):
+    """BlendVision 展示頁只有前端程式，yt-dlp 無法解析 (Unsupported URL)。
+    依前端流程：網址的 token 換成播放 token → 開始播放 session → 取得 HLS 網址。"""
+    import requests
+
+    token = parse_qs(urlparse(url).query).get('token', [''])[0]
+    if not token:
+        raise RuntimeError('BlendVision 網址沒有 token')
+    api = 'https://api.one.blendvision.com/bv/playback/v1'
+    r = requests.post(f'{api}/tokens', json={}, headers={'Authorization': f'Bearer {token}', 'User-Agent': UA}, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f'BlendVision 播放 token 取得失敗：{r.text[:200]}')
+    headers = {'Authorization': f'Bearer {r.json()["token"]}', 'User-Agent': UA}
+    session = f'{api}/sessions/{uuid.uuid4()}'
+    requests.post(f'{session}:start', headers=headers, timeout=60).raise_for_status()
+    sources = requests.get(session, headers=headers, timeout=60).json().get('sources', [])
+    for manifest in (m for s in sources for m in s.get('manifests', [])):
+        if manifest.get('protocol') == 'PROTOCOL_HLS':
+            return manifest['url']
+    raise RuntimeError(f'BlendVision 沒有 HLS 串流：{json.dumps(sources)[:200]}')
 
 
 def run(cmd, timeout):
