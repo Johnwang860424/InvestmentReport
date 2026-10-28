@@ -460,7 +460,34 @@ def resolve_url(url):
             return m.group(1)
     if 'showroom.one.blendvision.com' in url:
         return blendvision_manifest(url)
+    if re.search(r'zucast\.com/(webcast|event)/', url):
+        return zucast_mp3(url)
     return url
+
+
+def zucast_mp3(url):
+    """Zucast 網路法說會要先填聽眾資料才會進入播放頁，yt-dlp 無法解析 (Unsupported URL)。
+    依前端流程：以假資料送出表單 → 播放頁的 window._init 帶有 chid、event_url_code → 組出重播 mp3 網址。"""
+    import requests
+
+    event_id = re.search(r'zucast\.com/(?:webcast|event)/(\w+)', url).group(1)
+    s = requests.Session()
+    s.headers['User-Agent'] = UA
+    form_url = f'https://www.zucast.com/event/{event_id}/subscribe/create'
+    m = re.search(r'name="_token"[^>]*value="([^"]+)"', s.get(form_url, timeout=60).text)
+    if not m:
+        raise RuntimeError('Zucast 找不到聽眾資料表單')
+    form = {'_token': m.group(1), 'first_name': 't', 'last_name': 't', 'firm_name': 't', 'firm_type': '',
+            'region_code': '', 'email': 't@t.t', 'telephone': '', 'role': '', 'agreement': '1'}
+    html = s.post(f'https://www.zucast.com/api/event/{event_id}/subscribe', data=form,
+                  headers={'Referer': form_url}, timeout=60).text
+    m = re.search(r'window\._init=(\{.*?\});</script>', html)
+    if not m:
+        raise RuntimeError('Zucast 送出聽眾資料後沒有進入播放頁')
+    info = json.loads(m.group(1))
+    if str(info.get('vod_status')) != '1':
+        raise RuntimeError('Zucast 尚未提供重播')
+    return f'https://production-mp3-full.s3.amazonaws.com/{event_id}/ch{int(info["chid"]):02d}-{info["event_url_code"]}.mp3'
 
 
 def blendvision_manifest(url):
