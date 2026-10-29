@@ -120,7 +120,9 @@ if (typeof __name === 'undefined') {
   }
 
   public static async printPageToPdf(sourcePage: Page, url: string, filePath: string): Promise<void> {
-    if (Config.headless) {
+    // page.pdf() only works in headless Chromium; pages from a CDP-attached headed
+    // browser (e.g. the manual KGI login) must go through the print browser instead.
+    if (Config.headless && sourcePage.context().browser() === this.browser) {
       await sourcePage.pdf({ path: filePath, format: 'A4', printBackground: true });
       return;
     }

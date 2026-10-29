@@ -1,6 +1,7 @@
 import { chromium, Browser, Page, BrowserContext, Frame } from 'playwright';
 import { spawn } from 'child_process';
 import * as fs from 'fs';
+import * as net from 'net';
 import * as path from 'path';
 import { BaseSiteCrawler } from './base';
 import { CrawlOptions, ReportItem } from '../core/types';
@@ -322,6 +323,15 @@ export class KGICrawler extends BaseSiteCrawler {
   }
 
   /**
+   * 列表頁被導回登入頁代表 session 已在爬取途中失效，交由外層重新登入，避免誤判為「0 篇」成功。
+   */
+  private assertSessionActive(page: Page): void {
+    if (page.url().includes('/Login')) {
+      throw new KgiSessionRefreshRequiredError();
+    }
+  }
+
+  /**
    * 凱基投顧報告爬取與下載流程
    */
   async crawlAndDownload(page: Page, context: BrowserContext, options?: CrawlOptions): Promise<void> {
@@ -381,6 +391,7 @@ export class KGICrawler extends BaseSiteCrawler {
       const targetUrl = `${this.baseUrl}/Portal/Report/DetailList?ThisType=${cat.type}`;
       await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
       await page.waitForTimeout(2000);
+      this.assertSessionActive(page);
       await this.dismissPopups(page);
 
       let pageNum = 1;
@@ -541,6 +552,7 @@ export class KGICrawler extends BaseSiteCrawler {
 
         if (clickedNext) {
           await page.waitForTimeout(2000);
+          this.assertSessionActive(page);
           await this.dismissPopups(page);
           pageNum++;
         } else {
@@ -557,6 +569,18 @@ export class KGICrawler extends BaseSiteCrawler {
     console.log(`  - 資料不完整跳過: ${totalSkippedInvalid} 篇`);
     console.log(`=====================================================`);
   }
+}
+
+/** Asks the OS for an unused local port so we never attach to another debugging browser. */
+async function findFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address() as net.AddressInfo;
+      server.close(() => resolve(port));
+    });
+  });
 }
 
 /**
@@ -577,12 +601,19 @@ export async function refreshKgiSession(
   const browserPath = candidates.find(candidate => fs.existsSync(candidate));
   if (!browserPath) throw new Error('Google Chrome or Microsoft Edge was not found.');
 
-  const loginUrl = 'https://investment.kgisia.com.tw/Portal/Login/Login';
-  const checkUrl = 'https://investment.kgisia.com.tw/Portal/Report/DetailList?ThisType=3';
-  const port = 9222;
+  const credentials = Config.sites.kgi;
+  if (!credentials.user || !credentials.pass) {
+    throw new Error('Set KGI_USER and KGI_PASS before refreshing the KGI session.');
+  }
+
+  const baseUrl = 'https://investment.kgisia.com.tw';
+  const loginUrl = `${baseUrl}/Portal/Login/Login`;
+  const checkUrl = `${baseUrl}/Portal/Report/DetailList?ThisType=3`;
+  const port = await findFreePort();
   const profilePath = path.join(Config.tempDir, 'kgi-login-profile');
   fs.mkdirSync(profilePath, { recursive: true });
 
+  let spawnError: Error | null = null;
   const chromeProcess = spawn(browserPath, [
     `--remote-debugging-port=${port}`,
     `--user-data-dir=${profilePath}`,
@@ -590,48 +621,91 @@ export async function refreshKgiSession(
     '--no-default-browser-check',
     loginUrl,
   ], { detached: false, stdio: 'ignore' });
+  chromeProcess.once('error', error => { spawnError = error; });
 
-  await new Promise<void>(resolve => setTimeout(resolve, 1500));
+  // Without this, Ctrl+C leaves the browser running and holding the profile,
+  // so the next run's browser hands off to it and exits without a debugging port.
+  const killChrome = () => {
+    if (chromeProcess.exitCode === null && chromeProcess.signalCode === null) chromeProcess.kill();
+  };
+  const onSigint = () => {
+    killChrome();
+    process.exit(130);
+  };
+  process.once('exit', killChrome);
+  process.once('SIGINT', onSigint);
 
   let browser: Browser | null = null;
   try {
-    browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
-    const context = browser.contexts()[0];
-    const page = context.pages()[0] ?? await context.newPage();
-    const credentials = Config.sites.kgi;
-
-    if (!credentials.user || !credentials.pass) {
-      throw new Error('Set KGI_USER and KGI_PASS before refreshing the KGI session.');
+    const cdpDeadline = Date.now() + 30000;
+    for (;;) {
+      if (spawnError) throw new Error(`Failed to start ${browserPath}: ${(spawnError as Error).message}`);
+      if (chromeProcess.exitCode !== null || chromeProcess.signalCode !== null) {
+        throw new Error(
+          `The browser exited before remote debugging was ready. ` +
+          `Close any browser window still using ${profilePath} and retry.`
+        );
+      }
+      const ready = await fetch(`http://127.0.0.1:${port}/json/version`).then(res => res.ok, () => false);
+      if (ready) break;
+      if (Date.now() > cdpDeadline) throw new Error(`The browser did not open remote debugging port ${port} in time.`);
+      await new Promise<void>(resolve => setTimeout(resolve, 500));
     }
 
-    await page.waitForSelector('#Accounts', { state: 'visible', timeout: 15000 });
-    await page.fill('#Accounts', credentials.user);
-    await page.evaluate((user) => {
-      const visibleAccount = document.getElementById('Accounts') as HTMLInputElement | null;
-      const hiddenAccount = document.getElementById('Account') as HTMLInputElement | null;
-      if (visibleAccount) visibleAccount.value = user;
-      if (hiddenAccount) hiddenAccount.value = user;
-    }, credentials.user);
-    await page.fill('#ipt', credentials.pass);
+    browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
+    const context = browser.contexts()[0];
+    const page = context.pages().find(p => p.url().startsWith(baseUrl)) ?? context.pages()[0] ?? await context.newPage();
+    if (!page.url().startsWith(baseUrl)) {
+      await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    }
 
-    console.log('Complete Cloudflare manually in the opened browser. KGI will submit automatically after a token is available.');
-    const deadline = Date.now() + 180000;
-    let token = '';
-    while (Date.now() < deadline && page.url().includes('/Login')) {
-      token = await page.evaluate(() => {
-        const field = document.querySelector('[name="cf-turnstile-response"]') as HTMLInputElement | HTMLTextAreaElement | null;
-        return field?.value ?? '';
-      });
-      if (token) break;
+    // Cloudflare may show a full-page challenge before the form, and the persistent
+    // profile may still be signed in, so wait for either outcome instead of the form alone.
+    const isAuthenticatedUrl = (url: string) => url.startsWith(baseUrl) && !url.includes('/Login');
+    console.log('Waiting for the KGI login form. Complete any Cloudflare challenge in the opened browser.');
+    const formDeadline = Date.now() + 180000;
+    let alreadyLoggedIn = false;
+    for (;;) {
+      if (isAuthenticatedUrl(page.url())) {
+        alreadyLoggedIn = true;
+        break;
+      }
+      if (await page.locator('#Accounts').isVisible().catch(() => false)) break;
+      if (Date.now() > formDeadline) throw new Error('The KGI login form did not appear in time.');
       await page.waitForTimeout(1000);
     }
 
-    if (page.url().includes('/Login')) {
-      if (!token) throw new Error('Cloudflare verification timed out.');
-      const submitButton = page.locator('#submitBtn');
-      await submitButton.waitFor({ state: 'visible', timeout: 10000 });
-      await submitButton.click();
-      await page.waitForTimeout(1500);
+    if (!alreadyLoggedIn) {
+      await page.fill('#Accounts', credentials.user);
+      await page.evaluate((user) => {
+        const visibleAccount = document.getElementById('Accounts') as HTMLInputElement | null;
+        const hiddenAccount = document.getElementById('Account') as HTMLInputElement | null;
+        if (visibleAccount) visibleAccount.value = user;
+        if (hiddenAccount) hiddenAccount.value = user;
+      }, credentials.user);
+      await page.fill('#ipt', credentials.pass);
+
+      console.log('Complete Cloudflare manually in the opened browser. KGI will submit automatically after a token is available.');
+      const deadline = Date.now() + 180000;
+      let token = '';
+      while (Date.now() < deadline && page.url().includes('/Login')) {
+        // The page may navigate mid-poll (e.g. the user submits manually), which destroys the execution context.
+        token = await page.evaluate(() => {
+          const field = document.querySelector('[name="cf-turnstile-response"]') as HTMLInputElement | HTMLTextAreaElement | null;
+          return field?.value ?? '';
+        }).catch(() => '');
+        if (token) break;
+        await page.waitForTimeout(1000);
+      }
+
+      if (page.url().includes('/Login')) {
+        if (!token) throw new Error('Cloudflare verification timed out.');
+        const submitButton = page.locator('#submitBtn');
+        await submitButton.waitFor({ state: 'visible', timeout: 10000 });
+        await submitButton.click();
+        // Navigating away before the login POST settles would drop the session cookie.
+        await page.waitForURL(url => !url.pathname.includes('/Login'), { timeout: 30000 }).catch(() => { });
+      }
     }
 
     await page.goto(checkUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
@@ -656,6 +730,8 @@ export async function refreshKgiSession(
     }
   } finally {
     if (browser) await browser.close().catch(() => { });
-    chromeProcess.kill();
+    process.off('exit', killChrome);
+    process.off('SIGINT', onSigint);
+    killChrome();
   }
 }
