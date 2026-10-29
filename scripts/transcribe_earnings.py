@@ -56,7 +56,7 @@ MAX_ATTEMPTS = 5                           # 暫時性失敗（YouTube 驗證、
 RETRY_AFTER_HOURS = 24                     # 暫時性失敗後，隔多久才再試
 MIN_TRANSCRIPT_CHARS = 500                 # 逐字稿內文少於此字數視為失敗（靜音、片頭音樂或抓錯影片）
 MANIFEST_KEEP_MONTHS = 6                   # manifest 保留最近幾個月的紀錄，更舊的自動清除
-YT_PLAYER_CLIENTS = 'tv,web_safari,mweb'   # YouTube 播放器用戶端，依序嘗試；None = yt-dlp 預設
+YT_PLAYER_CLIENTS = 'default,tv,web_safari,mweb'  # YouTube 播放器用戶端；default = yt-dlp 預設用戶端 (直播剛結束的影片只有它抓得到)；None = 只用預設
 YT_SLEEP_SECONDS = 10                      # 每支 YouTube 下載前等待秒數，降低被判定為機器人；0 = 不等
 
 # 與 src/core/earnings.ts 共用的路徑
@@ -97,7 +97,7 @@ class Event:
 # 其他錯誤（YouTube 機器人驗證、網路逾時、限流…）視為暫時性，隔 RETRY_AFTER_HOURS 再試。
 # 證交所自己的連結（irconference / webpro）常是先公告、影片稍後才上架，一律視為暫時性。
 PERMANENT_ERROR_PATTERNS = [
-    'Unsupported URL', 'yt-dlp 沒有產生檔案', '逐字稿過短', 'HTTP Error 404', 'HTTP Error 410',
+    'Unsupported URL', 'yt-dlp 沒有產生檔案', 'HTTP Error 404', 'HTTP Error 410',
     'Video unavailable', 'Private video', 'This video has been removed', 'is not a valid URL',
 ]
 
@@ -566,7 +566,31 @@ def download_audio(url, stem, opts):
                     cmd += ['--extractor-args', f'youtube:player_client={YT_PLAYER_CLIENTS}']
                 if YT_SLEEP_SECONDS:
                     cmd += ['--sleep-requests', '2', '--sleep-interval', str(YT_SLEEP_SECONDS)]
-            run(cmd + [resolve_url(url)], timeout=3600)
+            resolved = resolve_url(url)
+            if 'youtu' in url:
+                # post_live 代表直播已結束，仍可能已有可下載的回放。
+                # 只攔截尚未開播或正在直播；回放是否可用交給 yt-dlp 判斷。
+                probe = subprocess.run(cmd + ['--skip-download', '--dump-single-json', resolved],
+                                       capture_output=True, text=True, encoding='utf-8',
+                                       errors='replace', timeout=120)
+                if probe.returncode != 0:
+                    raise RuntimeError((probe.stderr or probe.stdout).strip()[-500:])
+                info = json.loads(probe.stdout)
+                if info.get('is_live') or info.get('live_status') in ('is_live', 'is_upcoming'):
+                    raise RuntimeError('YouTube 尚未提供完整回放（未開播或直播中），稍後重試')
+                if info.get('live_status') == 'post_live':
+                    # post_live 的 DASH 分段在直接下載時可能變成空的惰性迭代器。
+                    # 探測 JSON 已展開分段清單，沿用它可避免再次擷取時遺失分段。
+                    metadata = WORK / f'{stem}_info.json'
+                    metadata.write_text(probe.stdout, encoding='utf-8')
+                    try:
+                        run(cmd + ['--load-info-json', str(metadata)], timeout=3600)
+                    finally:
+                        metadata.unlink(missing_ok=True)
+                else:
+                    run(cmd + [resolved], timeout=3600)
+            else:
+                run(cmd + [resolved], timeout=3600)
         raw = next((p for p in WORK.glob(f'{stem}_raw.*') if p.suffix != '.part'), None)
         if raw is None:
             raise RuntimeError('yt-dlp 沒有產生檔案')
@@ -587,6 +611,19 @@ class AgyError(RuntimeError):
 
 class AgyQuotaError(AgyError):
     """agy 額度用完 (429)，且重置時間太久或無法得知，不值得等待；停止本次執行。"""
+
+
+def is_silent_audio(path):
+    """只跳過整段音量皆低於 -60 dB 的音檔；偵測失敗時照常轉錄。"""
+    try:
+        p = subprocess.run([ffmpeg_exe(), '-hide_banner', '-nostats', '-i', str(path),
+                            '-af', 'volumedetect', '-f', 'null', '-'],
+                           capture_output=True, text=True, encoding='utf-8',
+                           errors='replace', timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    peak = re.search(r'max_volume:\s*(-inf|[-\d.]+) dB', p.stderr)
+    return p.returncode == 0 and peak is not None and float(peak.group(1)) <= -60
 
 
 def quota_reset_seconds(message):
@@ -703,6 +740,7 @@ class AgyTranscriber:
             f'- 使用{language}，忠實記錄說話內容，不要摘要、改寫或省略；聽不清楚的地方標註「（聽不清）」。\n'
             '- 內容包含營收、毛利率、展望等財務用語，公司名稱與專有名詞請依上下文判斷。\n'
             '- 約每 30 秒到 1 分鐘一行，time 為該行在「這個音檔」中的開始時間 (mm:ss)，text 為該行逐字稿。\n'
+            '- 若整段只有靜音、等待直播或背景音樂，沒有可辨識的說話，請回傳 {"lines": []}；不要編造內容。\n'
             '- 音檔已經切好，直接讀取整個音檔轉寫；不要切割、轉換音檔，不要執行任何終端機指令，也不要建立任何檔案。'
         )
 
@@ -719,6 +757,9 @@ class AgyTranscriber:
     def run_agy(self, part, ev, lang, index, total, length):
         """轉寫一段。--sandbox 禁止 agy 執行終端機指令 (避免它自己切檔、轉檔)，
         --json-schema 強制結構化輸出，只讀最後的 structured_output，不受中間思考過程與工具呼叫影響。"""
+        if is_silent_audio(part):
+            print(f'   ⏭ 第 {index}/{total} 段為靜音，略過轉錄（保留原始時間戳）', flush=True)
+            return []
         cmd = [self.agy, '-p', self.prompt(part, ev, lang, index, total, length),
                '--model', self.model, '--dangerously-skip-permissions', '--add-dir', str(part.parent),
                '--sandbox', '--output-format', 'json', '--json-schema', TRANSCRIPT_SCHEMA]
